@@ -25,7 +25,9 @@ read_vista_counts(
 \arguments{
 \item{x}{Count input. Supported values depend on \code{format} and include a
 matrix, data frame, single file path, vector of file paths, or a
-tximport-like list with \code{counts}, \code{abundance}, and/or \code{length}.}
+tximport-like list with a \code{counts} matrix (required) and, optionally,
+\code{abundance} and \code{length} matrices and \code{countsFromAbundance}, which VISTA
+uses to derive length-scaled counts when needed.}
 
 \item{format}{Input format. One of \code{"auto"}, \code{"matrix"},
 \code{"featurecounts"}, \code{"star"}, \code{"htseq"}, \code{"tximport"}, or \code{"rsem"}.}
@@ -46,14 +48,30 @@ returned \code{row_data}.}
 \item{count_column}{Optional count column selector for formats that expose
 multiple count choices. For STAR, use one of \code{"unstranded"},
 \code{"stranded_first"}, or \code{"stranded_second"}. For RSEM, this defaults to
-\code{"expected_count"}.}
+\code{"expected_count"}. Where it selects the values read from RSEM output, only
+\code{"expected_count"} and \code{"posterior_mean_count"} are accepted, since RSEM's
+other columns (TPM, FPKM, lengths and their posterior summaries) are not
+counts; a merged table whose sample columns are named in \code{sample_names} is
+read as given.}
 
 \item{tx2gene}{Optional two-column mapping used to summarize transcript-level
 tximport-like inputs to genes. The first column should contain transcript
 IDs and the second column gene IDs.}
 
-\item{counts_from}{Which matrix to extract from a tximport-like input:
-\code{"counts"}, \code{"abundance"}, or \code{"length"}.}
+\item{counts_from}{Which matrix of a tximport-like input to use. Only
+\code{"counts"} is accepted: \code{"abundance"} (TPM) and \code{"length"} are not counts
+and now raise an error. When the counts are not length-scaled
+(tximport's default \code{countsFromAbundance = "no"}) and the input carries
+\code{abundance} and \code{length}, VISTA converts them to length-scaled TPM counts,
+tximport's recommendation for DE methods that do not use length offsets.
+Scaled gene-level counts (\code{"scaledTPM"}, \code{"lengthScaledTPM"}) are used as
+they are. With \code{tx2gene}, transcript-level input is summarised to genes as
+tximport's \code{summarizeToGene()} does: when \code{abundance} and \code{length} are
+present, gene counts are rebuilt from them (\code{"scaledTPM"} input stays
+scaledTPM; all other input becomes lengthScaledTPM), because summing
+lengthScaledTPM transcript counts would undo the gene-level length
+correction. An unrecognised \code{countsFromAbundance} value is an error.
+\code{abundance} and \code{length} are matched to \code{counts} by row and column names.}
 
 \item{drop_technical}{Logical; when \code{TRUE}, drop known technical summary rows
 from STAR/HTSeq inputs.}

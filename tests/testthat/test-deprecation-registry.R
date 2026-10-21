@@ -379,3 +379,52 @@ test_that("concept names are unified with warning aliases (3d)", {
   l_new <- get_expression_lollipop(v, genes = genes, linewidth = 2)
   expect_equal(ggplot2::ggplot_build(l_old)$data, ggplot2::ggplot_build(l_new)$data)
 })
+
+test_that("every registered default change describes a real argument and its current default", {
+  reg <- VISTA:::.vista_default_changes()
+  expect_named(reg, c("fun", "arg", "old_default", "new_default", "announced_in", "changes_in", "note"))
+  ns <- asNamespace("VISTA")
+  for (i in seq_len(nrow(reg))) {
+    f <- get(reg$fun[i], envir = ns)
+    expect_true(reg$arg[i] %in% names(formals(f)), info = reg$fun[i])
+    # The first choice of the default vector is the default match.arg() picks.
+    current <- eval(formals(f)[[reg$arg[i]]])[1]
+    expect_identical(current, reg$old_default[i], info = reg$fun[i])
+    expect_true(package_version(reg$announced_in[i]) < package_version(reg$changes_in[i]))
+  }
+})
+
+test_that("the default-change notice is a classed message naming both values", {
+  expect_message(
+    VISTA:::.vista_default_change_notice("create_vista", "edger_test"),
+    class = "vista_default_change"
+  )
+  msg <- tryCatch(
+    VISTA:::.vista_default_change_notice("create_vista", "edger_test"),
+    vista_default_change = conditionMessage
+  )
+  expect_match(msg, '"LRT" to "QL" in VISTA 1.4.0', fixed = TRUE)
+  expect_match(msg, 'edger_test = "LRT"', fixed = TRUE)
+})
+
+test_that("each default change moves to one of the argument's accepted values", {
+  reg <- VISTA:::.vista_default_changes()
+  ns <- asNamespace("VISTA")
+  for (i in seq_len(nrow(reg))) {
+    choices <- eval(formals(get(reg$fun[i], envir = ns))[[reg$arg[i]]])
+    expect_true(reg$new_default[i] %in% choices, info = reg$fun[i])
+    msg <- tryCatch(
+      VISTA:::.vista_default_change_notice(reg$fun[i], reg$arg[i]),
+      vista_default_change = conditionMessage
+    )
+    expect_match(msg, sprintf('"%s" to "%s" in VISTA %s', reg$old_default[i], reg$new_default[i], reg$changes_in[i]), fixed = TRUE)
+  }
+})
+
+test_that("edgeR's default moves from the likelihood-ratio test to QL in 1.4.0", {
+  reg <- VISTA:::.vista_default_changes()
+  rows <- reg[reg$arg == "edger_test", , drop = FALSE]
+  expect_setequal(rows$fun, c("create_vista", "run_edger_analysis", "benchmark_vista_equivalence", "validate_vista_deep"))
+  expect_true(all(rows$old_default == "LRT" & rows$new_default == "QL"))
+  expect_true(all(rows$announced_in == "1.2.0" & rows$changes_in == "1.4.0"))
+})

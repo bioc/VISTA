@@ -12,8 +12,21 @@
 #' }
 #'
 #' @param counts Raw counts (matrix/data.frame) with a gene-id column and sample columns.
-#' @param sample_info Data frame with sample metadata. Must contain \code{sample_names}
-#'   (or have rownames equal to sample columns in \code{counts}) and the \code{group_column}.
+#'   Estimated (non-integer) counts, e.g. from tximport or RSEM via
+#'   [read_vista_counts()], are accepted and rounded for DESeq2 after filtering.
+#'   Negative values are refused, and non-integer values summing to exactly one
+#'   million per sample (TPM/CPM) or small and almost all fractional (log scale)
+#'   draw a warning. VISTA cannot otherwise tell normalised values from counts,
+#'   so supply raw or estimated counts.
+#' @param sample_info Data frame with sample metadata, including the
+#'   \code{group_column}. Samples are matched to count columns by a
+#'   \code{sample_names} column. Without one, the rownames are used if they are
+#'   unique and are not the default \code{1, 2, ...}; they are then used as they
+#'   are and must name count columns, so reset the rownames of a row-subsetted
+#'   sheet with \code{rownames(x) <- NULL}. If neither is available, the first
+#'   of \code{sample_name}, \code{sample}, \code{sample_id}, \code{Run},
+#'   \code{run}, \code{Sample} and \code{SampleName} whose values name count
+#'   columns is used.
 #' @param column_geneid Column name in \code{counts} that contains gene identifiers.
 #' @param group_column Column in \code{sample_info} used to group samples.
 #' @param group_numerator Character vector of numerator groups for pairwise comparisons.
@@ -47,10 +60,18 @@
 #'   comparison (stored in \code{metadata(v)$comparison$colors}). Defaults to \code{"Dark 3"}.
 #' @param keep_raw_counts Logical; if \code{TRUE} (default), the filtered raw
 #'   count matrix is retained as a second assay named \code{"counts"}, reachable
-#'   with \code{counts(v)} and required by \code{as_deseq_dataset()}. This
+#'   with \code{counts(v)} and required by \code{as_deseq_dataset()}. For the
+#'   DESeq2 backend these are the rounded counts DESeq2 analysed. This
 #'   roughly doubles the assay footprint; set \code{FALSE} to omit it.
 #' @param validate Logical; if \code{TRUE} (default), run full \code{validate_vista()}
 #'   checks before returning the object.
+#' @param edger_test For \code{method = "edger"} or \code{"both"}, the edgeR test:
+#'   \code{"LRT"} (likelihood-ratio test; the default) or \code{"QL"}
+#'   (quasi-likelihood F-test, which the edgeR authors recommend for bulk RNA-seq
+#'   and which is less liberal with few replicates). The default changes to
+#'   \code{"QL"} in VISTA 1.4.0; until then, a call that runs edgeR without
+#'   setting it (or with \code{NULL}) prints a notice. The test used is recorded
+#'   in \code{cutoffs(v)$edger_test}.
 #'
 #' @return A \code{VISTA} object:
 #'   \itemize{
@@ -67,10 +88,16 @@
 #' \code{metadata(v)$de_results_by_method} and \code{metadata(v)$de_summary_by_method},
 #' and the active source is tracked in \code{metadata(v)$de_active_source}.
 #'
-#' In the consensus table, \code{log2fc} follows \code{consensus_log2fc} (with
-#' single-backend calls taking the contributing backend's estimate), while
+#' In the consensus table, \code{log2fc} follows \code{consensus_log2fc}, while
 #' \code{pvalue} and \code{padj} carry the less-significant of the two backends
-#' so the columns remain continuous and usable for volcano/MA plots and ranking.
+#' (a gene a backend did not test counts as \code{p = 1}) so the columns remain
+#' continuous and usable for volcano/MA plots and ranking. With
+#' \code{consensus_mode = "union"}, genes called by a single backend take that
+#' backend's estimate and p-values instead, so every called gene's columns
+#' agree with its call. The merged \code{padj} is a conservative ranking score,
+#' not an FDR-adjusted p-value of the consensus, and \code{regulation} is the
+#' call: in simulations the intersection lowered, but did not control, the
+#' false discovery rate of the single backends, and the union raised it.
 #' Per-backend values are always preserved alongside them in
 #' \code{log2fc_deseq2}, \code{log2fc_edger}, \code{pvalue_deseq2},
 #' \code{pvalue_edger}, \code{padj_deseq2}, and \code{padj_edger}, and the
@@ -149,9 +176,17 @@ create_vista <- function(counts,
                          group_palette = "Dark 2",
                          comparison_palette = "Dark 3",
                          keep_raw_counts = TRUE,
-                         validate = TRUE) {
+                         validate = TRUE,
+                         edger_test = c("LRT", "QL")) {
 
   method <- match.arg(method)
+  # Only calls that run edgeR and rely on the default are affected when it
+  # changes, so only they are told. NULL counts as unset, so a wrapper that
+  # forwards an unset value is told too.
+  if ((missing(edger_test) || is.null(edger_test)) && method %in% c("edger", "both")) {
+    .vista_default_change_notice("create_vista", "edger_test")
+  }
+  edger_test <- match.arg(edger_test)
   p_value_type <- match.arg(p_value_type, c("padj", "pvalue"))
   consensus_mode <- match.arg(consensus_mode)
   consensus_log2fc <- match.arg(consensus_log2fc)
@@ -257,7 +292,8 @@ create_vista <- function(counts,
         min_replicates = min_replicates,
         log2fc_cutoff = log2fc_cutoff,
         pval_cutoff = pval_cutoff,
-        p_value_type = ifelse(p_value_type == "padj", "FDR", "PValue")
+        p_value_type = ifelse(p_value_type == "padj", "FDR", "PValue"),
+        edger_test = edger_test
       ),
       limma = run_limma_analysis(
         counts = counts,
@@ -386,11 +422,21 @@ create_vista <- function(counts,
       design_formula = if (is.null(design_formula)) NULL else paste(deparse(design_formula), collapse = ""),
       consensus_mode = if (method == "both") consensus_mode else NULL,
       consensus_log2fc = if (method == "both") consensus_log2fc else NULL,
+      edger_test = if (method %in% c("edger", "both")) edger_test else NULL,
       active_source = result_source
     ),
     group_column  = group_column,
     group_palette = group_palette,
-    raw_counts    = if (isTRUE(keep_raw_counts)) de_results_base$raw_counts else NULL,
+    # With both engines, keep DESeq2's counts whichever source is active, so
+    # counts(v) does not depend on result_source and as_deseq_dataset() gets
+    # integers; both engines filter the same genes.
+    raw_counts    = if (!isTRUE(keep_raw_counts)) {
+      NULL
+    } else if (method == "both") {
+      de_results_deseq$raw_counts[rownames(de_results_base$norm_counts), , drop = FALSE]
+    } else {
+      de_results_base$raw_counts
+    },
     validate      = FALSE
   )
 

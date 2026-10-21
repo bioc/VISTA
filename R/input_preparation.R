@@ -16,7 +16,9 @@
 #'
 #' @param x Count input. Supported values depend on `format` and include a
 #'   matrix, data frame, single file path, vector of file paths, or a
-#'   tximport-like list with `counts`, `abundance`, and/or `length`.
+#'   tximport-like list with a `counts` matrix (required) and, optionally,
+#'   `abundance` and `length` matrices and `countsFromAbundance`, which VISTA
+#'   uses to derive length-scaled counts when needed.
 #' @param format Input format. One of `"auto"`, `"matrix"`,
 #'   `"featurecounts"`, `"star"`, `"htseq"`, `"tximport"`, or `"rsem"`.
 #' @param gene_id_column Optional gene identifier column in tabular inputs.
@@ -31,12 +33,28 @@
 #' @param count_column Optional count column selector for formats that expose
 #'   multiple count choices. For STAR, use one of `"unstranded"`,
 #'   `"stranded_first"`, or `"stranded_second"`. For RSEM, this defaults to
-#'   `"expected_count"`.
+#'   `"expected_count"`. Where it selects the values read from RSEM output, only
+#'   `"expected_count"` and `"posterior_mean_count"` are accepted, since RSEM's
+#'   other columns (TPM, FPKM, lengths and their posterior summaries) are not
+#'   counts; a merged table whose sample columns are named in `sample_names` is
+#'   read as given.
 #' @param tx2gene Optional two-column mapping used to summarize transcript-level
 #'   tximport-like inputs to genes. The first column should contain transcript
 #'   IDs and the second column gene IDs.
-#' @param counts_from Which matrix to extract from a tximport-like input:
-#'   `"counts"`, `"abundance"`, or `"length"`.
+#' @param counts_from Which matrix of a tximport-like input to use. Only
+#'   `"counts"` is accepted: `"abundance"` (TPM) and `"length"` are not counts
+#'   and now raise an error. When the counts are not length-scaled
+#'   (tximport's default `countsFromAbundance = "no"`) and the input carries
+#'   `abundance` and `length`, VISTA converts them to length-scaled TPM counts,
+#'   tximport's recommendation for DE methods that do not use length offsets.
+#'   Scaled gene-level counts (`"scaledTPM"`, `"lengthScaledTPM"`) are used as
+#'   they are. With `tx2gene`, transcript-level input is summarised to genes as
+#'   tximport's `summarizeToGene()` does: when `abundance` and `length` are
+#'   present, gene counts are rebuilt from them (`"scaledTPM"` input stays
+#'   scaledTPM; all other input becomes lengthScaledTPM), because summing
+#'   lengthScaledTPM transcript counts would undo the gene-level length
+#'   correction. An unrecognised `countsFromAbundance` value is an error.
+#'   `abundance` and `length` are matched to `counts` by row and column names.
 #' @param drop_technical Logical; when `TRUE`, drop known technical summary rows
 #'   from STAR/HTSeq inputs.
 #' @param remove_special_rows Logical; alias for `drop_technical`, retained for
@@ -1081,15 +1099,73 @@ match_vista_inputs <- function(counts,
   if (!is.list(x) || is.data.frame(x) || is.matrix(x)) {
     cli::cli_abort("tximport input must be a list-like object.")
   }
-  if (!counts_from %in% names(x)) {
-    cli::cli_abort("Requested {.arg counts_from} matrix {.val {counts_from}} is not present in the tximport input.")
+  # Abundance (TPM) and transcript lengths are not counts: the DE engines would
+  # model them as counts and report invalid statistics.
+  if (!identical(counts_from, "counts")) {
+    cli::cli_abort(c(
+      "{.code counts_from = \"{counts_from}\"} is not a count matrix, and the DE engines need counts.",
+      "i" = "Use {.code counts_from = \"counts\"} (the default); VISTA scales tximport's estimated counts by transcript length itself when needed."
+    ))
+  }
+  if (is.null(x[["counts", exact = TRUE]])) {
+    cli::cli_abort("The tximport input has no {.field counts} matrix.")
+  }
+  as_matrix <- function(m, what) {
+    if (!is.matrix(m) && !is.data.frame(m)) {
+      cli::cli_abort("The tximport {.field {what}} element must be a matrix or data frame.")
+    }
+    as.matrix(m)
+  }
+  mat <- as_matrix(x[["counts", exact = TRUE]], "counts")
+
+  # VISTA does not pass transcript-length offsets to the engines, so the counts
+  # must already account for length. tximport's default ("no") leaves them
+  # raw; VISTA then derives length-scaled TPM counts from the abundance and
+  # length matrices, as tximport recommends for methods without offsets.
+  # Summarising to genes also rebuilds counts from those matrices, as
+  # tximport's summarizeToGene() does: summing scaled transcript counts would
+  # undo the gene-level length correction.
+  scaling <- x[["countsFromAbundance", exact = TRUE]]
+  known_scalings <- c("no", "scaledTPM", "lengthScaledTPM", "dtuScaledTPM")
+  if (is.null(scaling)) {
+    scaling <- NA_character_
+  } else if (!(is.character(scaling) && length(scaling) == 1L && scaling %in% known_scalings)) {
+    cli::cli_abort("The tximport {.field countsFromAbundance} value must be one of {.val {known_scalings}}.")
+  }
+  scaled <- scaling %in% c("scaledTPM", "lengthScaledTPM", "dtuScaledTPM")
+  has_length <- !is.null(x[["abundance", exact = TRUE]]) && !is.null(x[["length", exact = TRUE]])
+  rebuild <- has_length && (!scaled || !is.null(tx2gene))
+
+  if (!has_length) {
+    if (identical(scaling, "no")) {
+      cli::cli_warn(c(
+        "tximport counts are not length-scaled ({.code countsFromAbundance = \"no\"}), and the input lacks the {.field abundance} or {.field length} matrix needed to scale them.",
+        "i" = "Using the estimated counts without transcript-length correction. Re-run tximport with {.code countsFromAbundance = \"lengthScaledTPM\"} to correct for it."
+      ))
+    } else if (scaled && !is.null(tx2gene)) {
+      cli::cli_warn(c(
+        "Summing transcript-level {.val {scaling}} counts to genes does not give gene-level length correction, and the input lacks the {.field abundance} or {.field length} matrix needed to rebuild them.",
+        "i" = "Summarise with tximport's {.fn summarizeToGene} first, or keep {.field abundance} and {.field length} in the input."
+      ))
+    }
   }
 
-  mat <- x[[counts_from]]
-  if (!is.matrix(mat) && !is.data.frame(mat)) {
-    cli::cli_abort("The selected tximport matrix must be a matrix or data frame.")
+  abundance <- len <- NULL
+  if (rebuild) {
+    abundance <- .tximport_align_matrix(as_matrix(x[["abundance", exact = TRUE]], "abundance"), mat, "abundance")
+    len <- .tximport_align_matrix(as_matrix(x[["length", exact = TRUE]], "length"), mat, "length")
   }
-  mat <- as.matrix(mat)
+  # Missing or negative values make the scaling undefined. Checked on the
+  # features that are kept, after tx2gene, as tximport does.
+  check_scalable <- function(counts, abundance, len) {
+    for (what in c("counts", "abundance", "length")) {
+      m <- switch(what, counts = counts, abundance = abundance, length = len)
+      bad <- colnames(m)[colSums(!is.finite(m) | m < 0) > 0]
+      if (length(bad)) {
+        cli::cli_abort("The tximport {.field {what}} matrix has missing, non-finite or negative values in sample{?s} {.val {bad}}.")
+      }
+    }
+  }
 
   if (!is.null(tx2gene)) {
     tx2gene <- as.data.frame(tx2gene, stringsAsFactors = FALSE)
@@ -1099,9 +1175,59 @@ match_vista_inputs <- function(counts,
     tx_map <- stats::setNames(as.character(tx2gene[[2]]), as.character(tx2gene[[1]]))
     gene_ids <- tx_map[rownames(mat)]
     keep <- !is.na(gene_ids) & nzchar(gene_ids)
-    mat <- mat[keep, , drop = FALSE]
+    if (!any(keep)) {
+      cli::cli_abort(c(
+        "None of the transcript IDs in the tximport input are in the first column of {.arg tx2gene}.",
+        "i" = "Check for version suffixes (e.g. {.val ENST00000456328.2} vs {.val ENST00000456328})."
+      ))
+    }
+    if (any(!keep)) {
+      cli::cli_inform("{sum(!keep)} transcript{?s} {?is/are} not in {.arg tx2gene} and {?was/were} left out.")
+    }
     gene_ids <- gene_ids[keep]
-    mat <- rowsum(mat, group = gene_ids, reorder = FALSE)
+    if (rebuild) {
+      check_scalable(mat[keep, , drop = FALSE], abundance[keep, , drop = FALSE], len[keep, , drop = FALSE])
+      gene_level <- .tximport_summarize_to_gene(
+        counts = mat[keep, , drop = FALSE],
+        abundance = abundance[keep, , drop = FALSE],
+        length = len[keep, , drop = FALSE],
+        gene_ids = gene_ids
+      )
+      mat <- gene_level$counts
+      abundance <- gene_level$abundance
+      len <- gene_level$length
+    } else {
+      mat <- rowsum(mat[keep, , drop = FALSE], group = gene_ids, reorder = FALSE)
+    }
+  }
+
+  if (rebuild) {
+    if (is.null(tx2gene)) {
+      check_scalable(mat, abundance, len)
+    }
+    target <- if (identical(scaling, "scaledTPM")) "scaledTPM" else "lengthScaledTPM"
+    rebuilt <- if (identical(target, "scaledTPM")) {
+      t(t(abundance) * (colSums(mat) / colSums(abundance)))
+    } else {
+      .tximport_length_scaled_counts(mat, abundance, len)
+    }
+    failed <- colnames(rebuilt)[colSums(!is.finite(rebuilt)) > 0]
+    if (length(failed)) {
+      cli::cli_abort("Could not scale the tximport counts of sample{?s} {.val {failed}}; {?its/their} total abundance is zero.")
+    }
+    dimnames(rebuilt) <- dimnames(mat)
+    mat <- rebuilt
+    origin <- if (is.na(scaling)) {
+      "The tximport input does not say whether its counts are length-scaled (no {.field countsFromAbundance}); VISTA treated them as unscaled"
+    } else if (!scaled) {
+      "tximport counts were not length-scaled"
+    } else {
+      "Transcript-level {.val {scaling}} counts were summarised to genes"
+    }
+    cli::cli_inform(c(
+      paste0(origin, " and built {.val {target}} counts from {.field abundance} and {.field length}."),
+      "i" = "This is tximport's {.code countsFromAbundance = \"{target}\"}, as {.fn summarizeToGene} computes it; it corrects for transcript length without offsets."
+    ))
   }
 
   out <- data.frame(
@@ -1117,6 +1243,76 @@ match_vista_inputs <- function(counts,
   )
 }
 
+# abundance and length must describe the same features and samples as counts,
+# in the same order; matched by name, or by shape when they carry no names.
+#' @keywords internal
+#' @noRd
+.tximport_align_matrix <- function(m, counts, what) {
+  if (identical(dimnames(m), dimnames(counts))) {
+    return(m)
+  }
+  # Each dimension is matched by name when this matrix names it, and by
+  # position only when it does not.
+  index <- function(m_names, c_names, n_m, n_c, dim_label) {
+    if (is.null(m_names)) {
+      if (n_m != n_c) {
+        cli::cli_abort("The tximport {.field {what}} matrix has {n_m} {dim_label}{?s} but {.field counts} has {n_c}.")
+      }
+      return(seq_len(n_m))
+    }
+    if (anyDuplicated(m_names) || anyDuplicated(c_names) || !setequal(m_names, c_names)) {
+      cli::cli_abort(c(
+        "The {dim_label} names of the tximport {.field {what}} matrix do not match those of {.field counts}.",
+        "i" = "{.field counts}, {.field abundance} and {.field length} must describe the same, uniquely named features and samples."
+      ))
+    }
+    match(c_names, m_names)
+  }
+  ri <- index(rownames(m), rownames(counts), nrow(m), nrow(counts), "row")
+  ci <- index(colnames(m), colnames(counts), ncol(m), ncol(counts), "column")
+  out <- m[ri, ci, drop = FALSE]
+  dimnames(out) <- dimnames(counts)
+  out
+}
+
+# tximport's countsFromAbundance = "lengthScaledTPM" (Soneson et al., 2015):
+# abundance times each gene's average length across samples, rescaled so every
+# sample keeps its original estimated library size.
+#' @keywords internal
+#' @noRd
+.tximport_length_scaled_counts <- function(counts, abundance, length) {
+  scaled <- abundance * rowMeans(length)
+  t(t(scaled) * (colSums(counts) / colSums(scaled)))
+}
+
+# Transcript-level tximport matrices summarised to genes as tximport's
+# summarizeToGene() does: counts and abundance are summed; length is the
+# abundance-weighted mean of the transcripts' lengths. Where a gene has no
+# abundance in a sample, its length there is the geometric mean of its lengths
+# in the other samples, or the plain mean transcript length when it has none.
+#' @keywords internal
+#' @noRd
+.tximport_summarize_to_gene <- function(counts, abundance, length, gene_ids) {
+  counts_g <- rowsum(counts, group = gene_ids, reorder = FALSE)
+  abundance_g <- rowsum(abundance, group = gene_ids, reorder = FALSE)
+  length_g <- rowsum(abundance * length, group = gene_ids, reorder = FALSE) / abundance_g
+
+  mean_tx_length <- rowMeans(length)
+  fallback <- tapply(mean_tx_length, factor(gene_ids, levels = unique(gene_ids)), mean)
+  missing_rows <- which(apply(length_g, 1, function(r) any(is.nan(r))))
+  for (i in missing_rows) {
+    row <- length_g[i, ]
+    gap <- is.nan(row)
+    length_g[i, ] <- if (all(gap)) {
+      fallback[[rownames(length_g)[i]]]
+    } else {
+      replace(row, gap, exp(mean(log(row[!gap]))))
+    }
+  }
+
+  list(counts = counts_g, abundance = abundance_g, length = length_g)
+}
+
 #' @keywords internal
 #' @noRd
 .import_counts_rsem <- function(x,
@@ -1124,8 +1320,21 @@ match_vista_inputs <- function(counts,
                                 count_column = NULL,
                                 annotation_columns = NULL) {
   count_column <- count_column %||% "expected_count"
+  # Where count_column is the value read from RSEM output, it must be one of
+  # RSEM's count columns: TPM, FPKM, lengths and their posterior summaries
+  # would be modelled as counts and give invalid statistics. A merged table
+  # whose sample columns are named in `sample_names` is read as given.
+  require_count_column <- function() {
+    if (!tolower(count_column) %in% c("expected_count", "posterior_mean_count")) {
+      cli::cli_abort(c(
+        "{.arg count_column} {.val {count_column}} is not one of RSEM's count columns, and the DE engines need counts.",
+        "i" = "Use {.val expected_count} (the default) or {.val posterior_mean_count}."
+      ))
+    }
+  }
 
   if (is.character(x) && length(x) >= 1L && all(file.exists(x))) {
+    require_count_column()
     files <- x
     sample_names <- sample_names %||% .infer_file_sample_names(files)
     if (length(sample_names) != length(files)) {
@@ -1166,6 +1375,7 @@ match_vista_inputs <- function(counts,
       sample_cols <- count_column
     }
     if (identical(sample_cols, count_column)) {
+      require_count_column()
       out_counts <- df[, c("gene_id", count_column), drop = FALSE]
       names(out_counts)[2] <- "sample1"
     } else {

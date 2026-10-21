@@ -319,3 +319,40 @@ test_that("corr heatmap full triangle and show_diagonal stay consistent", {
     )
   }
 })
+
+test_that("DEG counts keep a comparison with no DEGs as zero", {
+  v <- example_vista()
+  summaries <- deg_summary(v)
+  comp <- "none_VS_control"
+  summaries[[comp]] <- data.frame(regulation = "Other", n = 100L)
+  local_mocked_bindings(.vista_deg_summary = function(x) summaries)
+
+  df <- VISTA:::.collect_deg_count_data(v)
+  rows <- df[df$sample_comparisons == comp, , drop = FALSE]
+  expect_setequal(as.character(rows$regulation), c("Up", "Down"))
+  expect_true(all(rows$n == 0))
+})
+
+test_that("DEG-count plots draw a zero-DEG comparison alone, and an all-zero object", {
+  v <- example_vista()
+  summaries <- deg_summary(v)
+  zero <- data.frame(regulation = "Other", n = 100L)
+  summaries[["none_VS_control"]] <- zero
+  local_mocked_bindings(.vista_deg_summary = function(x) summaries)
+
+  alone <- VISTA:::.collect_deg_count_data(v, sample_comparisons = "none_VS_control")
+  expect_setequal(as.character(alone$regulation), c("Up", "Down"))
+  expect_true(all(alone$n == 0))
+  expect_s3_class(get_deg_count_barplot(v, sample_comparisons = "none_VS_control"), "ggplot")
+
+  all_zero <- lapply(summaries, function(s) zero)
+  local_mocked_bindings(.vista_deg_summary = function(x) all_zero)
+  df <- VISTA:::.collect_deg_count_data(v)
+  expect_setequal(as.character(unique(df$sample_comparisons)), names(all_zero))
+  expect_true(all(df$n == 0))
+  for (plot_fun in list(get_deg_count_barplot, get_deg_count_pieplot, get_deg_count_donutplot)) {
+    p <- plot_fun(v)
+    expect_s3_class(p, "ggplot")
+    expect_no_error(ggplot2::ggplot_build(p))
+  }
+})

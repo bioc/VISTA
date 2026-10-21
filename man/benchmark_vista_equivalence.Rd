@@ -20,7 +20,8 @@ benchmark_vista_equivalence(
   covariates = NULL,
   design_formula = NULL,
   tolerance = 1e-08,
-  return_plots = FALSE
+  return_plots = FALSE,
+  edger_test = c("LRT", "QL")
 )
 }
 \arguments{
@@ -39,9 +40,11 @@ benchmark_vista_equivalence(
 \item{methods}{Character vector of backends to benchmark. Any subset of
 \code{c("deseq2", "edger", "limma")}.}
 
-\item{min_counts}{Minimum total counts per gene to retain.}
+\item{min_counts}{Minimum count a gene must reach in a sample to count as
+detected there; also the minimum row total.}
 
-\item{min_replicates}{Minimum samples per group meeting filtering criteria.}
+\item{min_replicates}{Minimum number of samples, across the whole
+experiment, in which a gene must reach \code{min_counts}.}
 
 \item{log2fc_cutoff}{Absolute log2 fold-change threshold for DEG calling.}
 
@@ -57,17 +60,65 @@ benchmark_vista_equivalence(
 
 \item{return_plots}{Logical; if \code{TRUE}, return paired VISTA/reference plots
 for MA, volcano, DEG count, and PCA views.}
+
+\item{edger_test}{The edgeR test, \code{"LRT"} (the default until VISTA 1.4.0) or
+\code{"QL"}; see \code{\link[=create_vista]{create_vista()}}. VISTA and the reference both use it.}
 }
 \value{
 A list with fields \code{valid}, \code{comparison_summary}, \code{visual_summary},
-and \code{methods}. Each element of \code{methods} contains the VISTA object, direct
-backend results, structural validation output, self-consistency checks, and
-optional plot objects.
+and \code{methods}. \code{comparison_summary} has one row per method and comparison
+recording whether the retained gene set, normalized counts, every numeric
+column the engine reports (\code{columns_compared}), regulation calls and DEG
+sets agree, with the largest absolute difference for the main columns. A
+\verb{*_within_tolerance} field is \code{NA} when the engine does not report that
+column (edgeR reports \code{logCPM}, not \code{baseMean}). Each element of \code{methods}
+contains the VISTA object, the reference results, structural validation
+output, self-consistency checks, and optional plot objects.
 }
 \description{
-Run VISTA and direct DESeq2, edgeR, and limma pipelines with matched
-preprocessing, contrast definitions, and DEG thresholds, then compare the
-resulting tables, DEG calls, normalized matrices, and critical plot inputs.
+Run VISTA and independent DESeq2, edgeR, and limma pipelines with the same
+filtering, design, contrast definitions, and DEG thresholds, then compare
+the retained genes, normalized matrices, every numeric column the engine
+reports, DEG calls, and critical plot inputs.
+}
+\details{
+The reference pipelines are written independently of the code they check.
+They call only base R, \pkg{stats} and the engines' own functions -- never
+VISTA's internal helpers -- and re-implement VISTA's documented contract
+from scratch:
+\itemize{
+\item \strong{Samples} are matched to count columns by a \code{sample_names} column, else
+by non-default rownames, else by the first of \code{sample_name}, \code{sample},
+\code{sample_id}, \code{Run}, \code{run}, \code{Sample} and \code{SampleName} whose values name
+count columns (the rule documented for \code{sample_info} in \code{\link[=create_vista]{create_vista()}}).
+\item \strong{Filtering} treats missing counts as zero and keeps genes whose total
+reaches \code{min_counts} and that reach \code{min_counts} in at least
+\code{min_replicates} samples. For DESeq2, non-integer counts (estimated counts
+from tximport or RSEM) are then rounded, as DESeq2 requires.
+\item \strong{Tests} are DESeq2's Wald test via \code{results()}, edgeR's \code{glmLRT()} or,
+with \code{edger_test = "QL"}, \code{glmQLFit()} and \code{glmQLFTest()}, and limma's
+\code{eBayes()} after \code{voom()}.
+\item \strong{Design} is \code{~ covariates + group} for DESeq2 and the same terms without
+an intercept for edgeR and limma-voom, or \code{design_formula} when supplied.
+\item \strong{Contrasts} for edgeR and limma are the difference between the design
+rows of two samples that differ only in group, so they do not depend on
+how design columns are named or which level is the reference.
+\item \strong{DEG calls} are \code{Up} when log2FC >= \code{log2fc_cutoff} and the selected
+p-value <= \code{pval_cutoff}, \code{Down} symmetrically, and \code{Other} otherwise,
+including when the engine reports no p-value.
+}
+
+VISTA's DE tables and normalized counts are read through its exported
+accessors (\code{\link[=comparisons]{comparisons()}}, \code{\link[=norm_counts]{norm_counts()}}). The MA, PCA and DEG-count
+checks read the data \code{\link[=get_ma_plot]{get_ma_plot()}}, \code{\link[=get_pca_plot]{get_pca_plot()}} and the DEG-count
+plots draw; the volcano check rebuilds its inputs from the stored table.
+Rows are matched by gene identifier, not position, and the set of
+comparisons must agree as well. A
+defect in sample matching, design construction, contrast signs, DEG calling
+or row alignment therefore shows up as a mismatch instead of being
+reproduced on both sides. The two sides share only the engines and the
+contract above: the benchmark checks that VISTA runs DESeq2, edgeR and limma
+faithfully, not that those packages are correct.
 }
 \examples{
 v <- example_vista()

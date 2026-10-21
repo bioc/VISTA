@@ -38,6 +38,13 @@
 #' @param pval_cutoff P-value or adjusted p-value cutoff for significance. Default: \code{0.05}.
 #' @param p_value_type For DESeq2: one of \code{"padj"} or \code{"pvalue"}.
 #'   For edgeR/limma: one of \code{"FDR"} or \code{"PValue"}.
+#' @param edger_test edgeR only: \code{"LRT"} (likelihood-ratio test,
+#'   \link[edgeR]{glmFit} and \link[edgeR]{glmLRT}; the default) or \code{"QL"}
+#'   (quasi-likelihood F-test, \link[edgeR]{glmQLFit} and
+#'   \link[edgeR]{glmQLFTest}, as the edgeR authors recommend for bulk RNA-seq).
+#'   The default changes to \code{"QL"} in VISTA 1.4.0; until then, leaving it
+#'   unset (or \code{NULL}) prints a notice. Set it explicitly to keep results
+#'   stable.
 #'
 #' @return A named list with components:
 #' \itemize{
@@ -53,7 +60,8 @@
 #' @details
 #' \itemize{
 #'   \item For DESeq2, normalization is performed via \link[DESeq2]{DESeq}, and DE testing uses \link[DESeq2]{results}.
-#'   \item For edgeR, normalization uses \link[edgeR]{calcNormFactors}, and testing uses \link[edgeR]{glmLRT}.
+#'   \item For edgeR, normalization uses \link[edgeR]{calcNormFactors}, and testing uses
+#'     \link[edgeR]{glmLRT} or, with \code{edger_test = "QL"}, \link[edgeR]{glmQLFTest}.
 #'   \item For limma, normalization uses \link[edgeR]{calcNormFactors} + \link[limma]{voom},
 #'     and testing uses \link[limma]{eBayes}.
 #' }
@@ -61,7 +69,14 @@
 #' edgeR/limma backends before \link[edgeR]{calcNormFactors} so that
 #' normalization factors are not estimated from genes that will be discarded.
 #' All three backends use the same filtering predicate: a gene is retained when
-#' at least \code{min_replicates} samples reach \code{min_counts}.
+#' at least \code{min_replicates} samples reach \code{min_counts}. Filtering is
+#' applied to the counts as given; DESeq2 then receives non-integer (estimated)
+#' counts rounded to the nearest integer, as \code{DESeqDataSetFromTximport()}
+#' does, with a message. Every backend refuses negative values and warns about
+#' non-integer values with an unmistakable sign of not being counts (every
+#' sample summing to exactly one million, or small, almost all fractional
+#' values). VISTA cannot otherwise verify that its input is counts: supply raw
+#' or estimated counts, not normalised values.
 #' Gene regulation status is determined via \code{.categorize_deg_results()} based on user thresholds.
 #'
 #' All output comparison results are internally standardized via \code{.tidy_de_results()} to ensure
@@ -266,10 +281,10 @@ NULL
     if (grepl("[:*]", f_txt)) {
       cli::cli_abort("Interactions in {.arg design_formula} are not currently supported for edgeR. Use additive terms only.")
     }
-    rhs_txt <- trimws(strsplit(f_txt, "~", fixed = TRUE)[[1]][2])
-    has_no_intercept <- grepl("(^|\\+)\\s*0\\s*\\+|\\-\\s*1", rhs_txt)
-    if (!has_no_intercept) {
-      design_formula <- stats::as.formula(paste("~ 0 +", rhs_txt))
+    # Ask R whether the formula has an intercept rather than pattern-matching
+    # its text: "~ 1 + a" has one, and prefixing "0 +" would not remove it.
+    if (attr(stats::terms(design_formula), "intercept") == 1L) {
+      design_formula <- stats::update(design_formula, ~ . - 1)
     }
   }
 
@@ -324,6 +339,45 @@ NULL
   contrast
 }
 
+#' Check that a count matrix holds counts
+#'
+#' Negative values are never counts and are refused. Non-integer input is
+#' accepted -- estimated counts from tximport or RSEM are fractional -- with a
+#' warning when it has an unmistakable sign of not being counts: every sample
+#' summing to exactly one million (TPM or CPM), or values that are small and
+#' almost all fractional (log scale). These are warnings, not errors: no rule
+#' on the values alone can tell counts from normalised data reliably, so
+#' estimated counts at about one million reads are not refused, and TMM-CPM,
+#' FPKM or filtered TPM are not caught.
+#'
+#' @param counts Matrix or data frame of counts (genes by samples).
+#' @return `TRUE` if any value is not a whole number, `FALSE` otherwise.
+#' @keywords internal
+#' @noRd
+.vista_check_counts <- function(counts) {
+  mat <- as.matrix(counts)
+  n_negative <- sum(mat < 0, na.rm = TRUE)
+  if (n_negative > 0) {
+    cli::cli_abort("Counts must be non-negative; {n_negative} value{?s} {?is/are} negative.")
+  }
+  fractional <- any(mat != round(mat), na.rm = TRUE)
+  if (!fractional) {
+    return(FALSE)
+  }
+  advice <- c("i" = "The DE engines model counts. For tximport or RSEM output, import it with {.fn read_vista_counts}, which uses the estimated counts.")
+  sums <- colSums(mat, na.rm = TRUE)
+  if (length(sums) && all(abs(sums - 1e6) <= 1e-6 * 1e6)) {
+    cli::cli_warn(c("These values may not be counts: every sample sums to exactly one million, as TPM or CPM values do.", advice),
+                  class = "vista_not_counts_warning")
+  }
+  positive <- mat[mat > 0 & !is.na(mat)]
+  if (length(positive) && max(positive) < 30 && mean(positive != round(positive)) >= 0.95) {
+    cli::cli_warn(c("These values may not be counts: they are small and almost all fractional, as log-transformed values are.", advice),
+                  class = "vista_not_counts_warning")
+  }
+  TRUE
+}
+
 #' @rdname run_deseq_analysis
 #' @export
 run_deseq_analysis <- function(
@@ -370,7 +424,19 @@ run_deseq_analysis <- function(
     tibble::as_tibble() %>%
     tibble::column_to_rownames(var = column_geneid)
   count_data[is.na(count_data)] <- 0
-  count_data <- count_data[rowSums(count_data) >= min_counts, ]
+  fractional <- .vista_check_counts(count_data)
+
+  # Filter the counts as given, as edgeR and limma do, so every engine keeps
+  # the same genes; only then round for DESeq2, which models integer counts
+  # (estimated counts from tximport or RSEM are fractional), as
+  # DESeqDataSetFromTximport() does.
+  count_mat <- as.matrix(count_data)
+  keep <- rowSums(count_mat) >= min_counts & rowSums(count_mat >= min_counts) >= min_replicates
+  count_data <- count_data[keep, , drop = FALSE]
+  if (fractional) {
+    cli::cli_inform("DESeq2 needs integer counts; rounding the non-integer (estimated) counts after filtering.")
+    count_data[] <- lapply(count_data, round)
+  }
 
   # Prepare DESeq2 input
   col_data <- sample_info %>%
@@ -400,7 +466,6 @@ run_deseq_analysis <- function(
     colData = col_data,
     design = de_design
   )
-  dds <- dds[rowSums(DESeq2::counts(dds) >= min_counts) >= min_replicates, ]
   dds <- DESeq2::DESeq(dds)
 
   # Normalized counts
@@ -452,9 +517,15 @@ run_edger_analysis <- function(
     min_replicates = 1,
     log2fc_cutoff = 1,
     pval_cutoff = 0.05,
-    p_value_type = "FDR"
+    p_value_type = "FDR",
+    edger_test = c("LRT", "QL")
 ) {
   p_value_type <- match.arg(p_value_type, c("FDR", "PValue"))
+  # NULL counts as unset, so a wrapper forwarding an unset value is told too.
+  if (missing(edger_test) || is.null(edger_test)) {
+    .vista_default_change_notice("run_edger_analysis", "edger_test")
+  }
+  edger_test <- match.arg(edger_test)
   sample_info <- .normalize_sample_info(
     sample_info = sample_info,
     counts = counts,
@@ -485,6 +556,7 @@ run_edger_analysis <- function(
     tibble::as_tibble() %>%
     tibble::column_to_rownames(column_geneid)
   count_data[is.na(count_data)] <- 0
+  .vista_check_counts(count_data)
   count_data <- count_data[rowSums(count_data) >= min_counts, ]
 
   # Metadata
@@ -522,8 +594,14 @@ run_edger_analysis <- function(
 
   design <- stats::model.matrix(de_design, data = col_data)
 
-  dge <- edgeR::estimateDisp(dge, design)
-  fit <- edgeR::glmFit(dge, design)
+  if (identical(edger_test, "QL")) {
+    # edgeR v4 quasi-likelihood pipeline: glmQLFit() estimates the NB
+    # dispersion itself, so estimateDisp() is not needed.
+    fit <- edgeR::glmQLFit(dge, design)
+  } else {
+    dge <- edgeR::estimateDisp(dge, design)
+    fit <- edgeR::glmFit(dge, design)
+  }
 
   norm_counts <- edgeR::cpm(dge, normalized.lib.sizes = TRUE)
 
@@ -551,8 +629,12 @@ run_edger_analysis <- function(
       numerator = num,
       denominator = den
     )
-    lrt <- edgeR::glmLRT(fit, contrast = contrast_vector)
-    res <- edgeR::topTags(lrt, n = Inf)$table
+    tested <- if (identical(edger_test, "QL")) {
+      edgeR::glmQLFTest(fit, contrast = contrast_vector)
+    } else {
+      edgeR::glmLRT(fit, contrast = contrast_vector)
+    }
+    res <- edgeR::topTags(tested, n = Inf)$table
 
     comp_name <- paste(num, den, sep = "_VS_")
     res$gene_id <- rownames(res)
@@ -628,6 +710,7 @@ run_limma_analysis <- function(
     tibble::as_tibble() %>%
     tibble::column_to_rownames(column_geneid)
   count_data[is.na(count_data)] <- 0
+  .vista_check_counts(count_data)
   count_data <- count_data[rowSums(count_data) >= min_counts, , drop = FALSE]
 
   col_data <- sample_info %>%
@@ -1195,7 +1278,7 @@ run_limma_analysis <- function(
   df <- rename_one(df, c("pvalue","PValue","P.Value","p_val","p"),          "pvalue")
   df <- rename_one(df, c("padj","FDR","qvalue","svalue"),                    "padj")
   df <- rename_one(df, c("baseMean","AveExpr"),                              "baseMean")
-  df <- rename_one(df, c("stat","LR","t"),                                   "stat")
+  df <- rename_one(df, c("stat","LR","F","t"),                               "stat")
 
   # --- robust numeric coercion -------------------------------------------------
   to_num <- function(v) {
@@ -1205,8 +1288,10 @@ run_limma_analysis <- function(
   }
   num_like <- intersect(c("baseMean","log2fc","lfcSE","stat","pvalue","padj","logCPM"), names(df))
   for (nm in num_like) df[[nm]] <- to_num(df[[nm]])
-  # p-values: make non-finite NA -> 1
-  if ("pvalue" %in% names(df)) df$pvalue[!is.finite(df$pvalue) | is.na(df$pvalue)] <- 1
+  # A missing p-value stays missing. Engines use NA for genes they did not test
+  # (DESeq2 Cook's-distance outliers); storing 1 instead would report an
+  # untested gene as tested, beside a padj that is still NA. Readers that need
+  # a number for drawing or ranking substitute one themselves.
 
   # --- canonical column order (gene_id first) ---------------------------------
   canon <- c("gene_id","baseMean","log2fc","lfcSE","stat","pvalue","padj","regulation")
@@ -1460,30 +1545,37 @@ run_limma_analysis <- function(
       deseq2 = d_log2fc,
       edger = e_log2fc
     )
-    # For method-specific calls in union mode, use the contributing method FC.
-    log2fc_consensus[support == "deseq2_only"] <- d_log2fc[support == "deseq2_only"]
-    log2fc_consensus[support == "edger_only"] <- e_log2fc[support == "edger_only"]
+
+    # Per-backend columns report what each engine returned, NA included.
+    d_pvalue <- if ("pvalue" %in% names(d)) .safe_numeric(d$pvalue, default = NA_real_) else rep(NA_real_, length(ref_rn))
+    e_pvalue <- if ("pvalue" %in% names(e)) .safe_numeric(e$pvalue, default = NA_real_) else rep(NA_real_, length(ref_rn))
+    d_padj <- if ("padj" %in% names(d)) .safe_numeric(d$padj, default = NA_real_) else d_pvalue
+    e_padj <- if ("padj" %in% names(e)) .safe_numeric(e$padj, default = NA_real_) else e_pvalue
+
+    # The merged columns treat an untested gene as having no evidence (p = 1)
+    # and carry the less-significant of the two backends, so they stay
+    # continuous for ranking and plotting. They are a conservative score, not
+    # an FDR-adjusted p-value of the consensus; `regulation` is the call.
+    no_evidence <- function(p) replace(p, is.na(p), 1)
+    pvalue_consensus <- pmax(no_evidence(d_pvalue), no_evidence(e_pvalue))
+    padj_consensus <- pmax(no_evidence(d_padj), no_evidence(e_padj))
+
+    # Only union mode calls genes on one backend's evidence. Those calls take
+    # the calling backend's values, so a called gene's columns agree with its
+    # call. In intersection mode a single-backend gene is not called and keeps
+    # the conservative values above; giving it the calling backend's padj
+    # would make `padj <= cutoff` select the union.
+    if (consensus_mode == "union") {
+      d_only_idx <- support == "deseq2_only"
+      e_only_idx <- support == "edger_only"
+      log2fc_consensus[d_only_idx] <- d_log2fc[d_only_idx]
+      log2fc_consensus[e_only_idx] <- e_log2fc[e_only_idx]
+      pvalue_consensus[d_only_idx] <- no_evidence(d_pvalue)[d_only_idx]
+      padj_consensus[d_only_idx] <- no_evidence(d_padj)[d_only_idx]
+      pvalue_consensus[e_only_idx] <- no_evidence(e_pvalue)[e_only_idx]
+      padj_consensus[e_only_idx] <- no_evidence(e_padj)[e_only_idx]
+    }
     log2fc_consensus[!is.finite(log2fc_consensus)] <- NA_real_
-
-    d_pvalue <- if ("pvalue" %in% names(d)) .safe_numeric(d$pvalue, default = 1) else rep(1, length(ref_rn))
-    e_pvalue <- if ("pvalue" %in% names(e)) .safe_numeric(e$pvalue, default = 1) else rep(1, length(ref_rn))
-    d_padj <- if ("padj" %in% names(d)) .safe_numeric(d$padj, default = 1) else d_pvalue
-    e_padj <- if ("padj" %in% names(e)) .safe_numeric(e$padj, default = 1) else e_pvalue
-
-    # Every gene carries the less-significant (more conservative) of the two
-    # backends, so the consensus p-value columns stay continuous and usable for
-    # volcano/MA plots and ranking. Genes called by a single backend then take
-    # that backend's value below.
-    pvalue_consensus <- pmax(d_pvalue, e_pvalue, na.rm = TRUE)
-    padj_consensus <- pmax(d_padj, e_padj, na.rm = TRUE)
-
-    d_only_idx <- support == "deseq2_only"
-    e_only_idx <- support == "edger_only"
-
-    pvalue_consensus[d_only_idx] <- d_pvalue[d_only_idx]
-    padj_consensus[d_only_idx] <- d_padj[d_only_idx]
-    pvalue_consensus[e_only_idx] <- e_pvalue[e_only_idx]
-    padj_consensus[e_only_idx] <- e_padj[e_only_idx]
 
     regulation <- rep("Other", length(ref_rn))
     up_idx <- consensus_significant & !is.na(log2fc_consensus) & log2fc_consensus >= log2fc_cutoff

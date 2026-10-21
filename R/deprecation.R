@@ -192,6 +192,77 @@
   invisible(NULL)
 }
 
+# Default changes -------------------------------------------------------------
+#
+# A default that is going to change is announced for one release before it
+# changes, so nobody's results move without warning: the old default stays,
+# and calls that rely on it -- by not setting the argument -- get a notice
+# saying what will change and how to choose. As with renames, the table is the
+# source of truth for the notice and for the test that checks it.
+
+#' @keywords internal
+#' @noRd
+.vista_default_changes <- function() {
+  # fun, arg, old_default, new_default, announced_in, changes_in, note
+  #
+  # INVARIANT: `arg` is a formal of `fun` whose current default is
+  # `old_default`; `test-deprecation-registry.R` asserts both.
+  ql_note <- "The edgeR authors recommend the quasi-likelihood F-test for bulk RNA-seq; the likelihood-ratio test is liberal with few replicates."
+  rows <- list(
+    c("create_vista", "edger_test", "LRT", "QL", "1.2.0", "1.4.0", ql_note),
+    c("run_edger_analysis", "edger_test", "LRT", "QL", "1.2.0", "1.4.0", ql_note),
+    c("benchmark_vista_equivalence", "edger_test", "LRT", "QL", "1.2.0", "1.4.0", ql_note),
+    c("validate_vista_deep", "edger_test", "LRT", "QL", "1.2.0", "1.4.0", ql_note)
+  )
+
+  out <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+  names(out) <- c("fun", "arg", "old_default", "new_default", "announced_in", "changes_in", "note")
+  out
+}
+
+#' Announce a default that will change
+#'
+#' Called when `arg` was left at its default in a call whose results the
+#' change would affect. Emits a message classed `vista_default_change`,
+#' throttled like the deprecation warnings (see `vista.deprecation_frequency`).
+#'
+#' @param fun,arg Character scalars naming the function and argument; together
+#'   they select a row of `.vista_default_changes()`.
+#' @return `invisible(NULL)`; called for its message.
+#' @keywords internal
+#' @noRd
+.vista_default_change_notice <- function(fun, arg) {
+  reg <- .vista_default_changes()
+  row <- reg[reg$fun == fun & reg$arg == arg, , drop = FALSE]
+  if (nrow(row) != 1L) {
+    cli::cli_abort("No default change is registered for {.arg {arg}} in {.fun {fun}}.")
+  }
+  msg <- sprintf(
+    paste0(
+      'The default `%s` in `%s()` changes from "%s" to "%s" in VISTA %s. ',
+      'Set `%s = "%s"` to keep the current results, or `%s = "%s"` to use the new default now. %s'
+    ),
+    arg, fun, row$old_default, row$new_default, row$changes_in,
+    arg, row$old_default, arg, row$new_default, row$note
+  )
+
+  freq <- match.arg(
+    getOption("vista.deprecation_frequency", "regularly"),
+    c("regularly", "once", "always")
+  )
+  if (identical(freq, "always")) {
+    rlang::inform(message = msg, class = "vista_default_change")
+  } else {
+    rlang::inform(
+      message = msg,
+      class = "vista_default_change",
+      .frequency = freq,
+      .frequency_id = paste("default", fun, arg, sep = "/")
+    )
+  }
+  invisible(NULL)
+}
+
 #' @keywords internal
 #' @noRd
 .vista_did_you_mean <- function(bad, candidates, n = 1L) {
@@ -342,8 +413,10 @@
 #' @details
 #' The table below is generated from the package's internal registry, so it is
 #' always in sync with the code. Warnings are classed
-#' `c("vista_deprecated_arg", "deprecatedWarning")` and are emitted at most once
-#' per session per argument, so they will not flood a loop.
+#' `c("vista_deprecated_arg", "deprecatedWarning")` and are throttled so they
+#' will not flood a loop: by default each is shown at most once every eight
+#' hours per argument. Set `options(vista.deprecation_frequency = "once")` for
+#' once per session, or `"always"` to see every occurrence.
 #'
 #' To silence them while you migrate:
 #' \preformatted{
@@ -361,9 +434,22 @@
 #' duplicated here, so it cannot drift out of date. Print it with the example
 #' below, or filter it to the function you are migrating.
 #'
+#' @section Defaults that will change:
+#' A default that is going to change is announced one release ahead, so
+#' results do not move without warning. The old default stays in force until
+#' the release named in `changes_in`; until then, a call that relies on it (by
+#' not setting the argument, or passing `NULL`) prints a message classed
+#' `vista_default_change`, throttled like the warnings above.
+#' Setting the argument explicitly, to either value, keeps results stable
+#' across the change and silences the message. In VISTA 1.2.0 this applies to
+#' `edger_test`, which moves from `"LRT"` (likelihood-ratio test) to `"QL"`
+#' (quasi-likelihood F-test) in VISTA 1.4.0, in [create_vista()],
+#' [run_edger_analysis()], [benchmark_vista_equivalence()] and
+#' [validate_vista_deep()].
+#'
 #' @name VISTA-deprecated
 #' @aliases VISTA-deprecated
-#' @return Not applicable; this page documents argument deprecations only.
+#' @return Not applicable; this page documents deprecations and default changes only.
 #' @examples
 #' # The full table of deprecated arguments and their timelines
 #' VISTA:::.vista_deprecations()[, c("fun", "old_arg", "new_arg", "defunct_in")]
@@ -371,5 +457,8 @@
 #' # Or just the one function you are migrating
 #' reg <- VISTA:::.vista_deprecations()
 #' reg[reg$fun == "get_corr_heatmap", c("old_arg", "new_arg", "defunct_in")]
+#'
+#' # Defaults that will change, and when
+#' VISTA:::.vista_default_changes()[, c("fun", "arg", "old_default", "new_default", "changes_in")]
 NULL
 

@@ -5343,6 +5343,24 @@ get_deg_venn_diagram <- function(x,
     return(NULL)
   }
 
+  # Zero DEGs is a result: a summary holding only "Other" is drawn as zero
+  # below. A summary holding none of VISTA's labels is not -- its counts would
+  # be drawn as zero too -- so name it and leave it out.
+  reg_chr <- as.character(df$regulation)
+  known <- tapply(reg_chr %in% c("Up", "Down", "Other"), df$sample_comparisons, any)
+  unknown_comps <- names(known)[!known]
+  if (length(unknown_comps)) {
+    cli::cli_warn(c(
+      "No {.val Up}/{.val Down}/{.val Other} labels in the DEG summary of {.val {unknown_comps}}; left out.",
+      "i" = "Labels found: {.val {unique(stats::na.omit(reg_chr[df$sample_comparisons %in% unknown_comps]))}}."
+    ))
+    deg_summary <- deg_summary[setdiff(names(deg_summary), unknown_comps)]
+    df <- df[!df$sample_comparisons %in% unknown_comps, , drop = FALSE]
+    if (!length(deg_summary)) {
+      return(NULL)
+    }
+  }
+
   df <- df |>
     dplyr::filter(
       !is.na(.data$sample_comparisons),
@@ -5350,17 +5368,18 @@ get_deg_venn_diagram <- function(x,
     ) |>
     dplyr::mutate(n = suppressWarnings(as.numeric(.data$n)))
 
-  if (!nrow(df)) {
-    cli::cli_warn("No {.val Up}/{.val Down} DEG counts were found in the summary.")
-    return(NULL)
-  }
-
+  # No early return when nothing is Up or Down: zero DEGs is a result, and the
+  # completion below draws it as zero counts.
   df$n[!is.finite(df$n)] <- NA_real_
   df <- df |>
     dplyr::group_by(.data$sample_comparisons, .data$regulation) |>
     dplyr::summarise(n = sum(.data$n, na.rm = TRUE), .groups = "drop")
 
-  available_comparisons <- unique(df$sample_comparisons)
+  # Taken from the summaries, not from `df`: a comparison with no DEGs has no
+  # Up/Down rows left after the filter above, and must be drawn as zero rather
+  # than dropped. Sorted as dplyr's grouping sorts (C locale), which is the
+  # order these plots have always used.
+  available_comparisons <- names(deg_summary)
   if (!is.null(sample_comparisons)) {
     missing <- setdiff(sample_comparisons, available_comparisons)
     if (length(missing)) {
@@ -5368,7 +5387,7 @@ get_deg_venn_diagram <- function(x,
     }
     comp_levels <- sample_comparisons
   } else {
-    comp_levels <- available_comparisons
+    comp_levels <- sort(available_comparisons, method = "radix")
   }
 
   df <- tidyr::complete(
@@ -5830,7 +5849,10 @@ get_ma_plot <- function(x,
     bm_df <- data.frame(gene_id = rownames(a), baseMean = rowMeans(a, na.rm = TRUE), stringsAsFactors = FALSE)
   }
 
-  # If DE already has a baseMean column, keep it but prefer bm_df via coalesce
+  # If DE already has a baseMean column, prefer the object's mean expression
+  # (bm_df) and fall back to the table's. For limma the table's baseMean is
+  # AveExpr, already log2-CPM, so taking it first put log10(log2-CPM + 1) on
+  # the x axis instead of the mean expression every other engine plots.
   has_bm <- "baseMean" %in% names(comp_tbl)
   plot_df <- comp_tbl |>
     dplyr::left_join(bm_df, by = "gene_id", suffix = c("", ".bm"))
@@ -5838,7 +5860,7 @@ get_ma_plot <- function(x,
   if (has_bm) {
     plot_df <- plot_df |>
       dplyr::mutate(
-        baseMean = dplyr::coalesce(.data$baseMean, .data$baseMean.bm)
+        baseMean = dplyr::coalesce(.data$baseMean.bm, .data$baseMean)
       ) |>
       dplyr::select(-dplyr::any_of("baseMean.bm"))
   }

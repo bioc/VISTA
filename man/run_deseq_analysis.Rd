@@ -35,7 +35,8 @@ run_edger_analysis(
   min_replicates = 1,
   log2fc_cutoff = 1,
   pval_cutoff = 0.05,
-  p_value_type = "FDR"
+  p_value_type = "FDR",
+  edger_test = c("LRT", "QL")
 )
 
 run_limma_analysis(
@@ -90,6 +91,14 @@ experiment, not within each group. Default: \code{1}.}
 
 \item{p_value_type}{For DESeq2: one of \code{"padj"} or \code{"pvalue"}.
 For edgeR/limma: one of \code{"FDR"} or \code{"PValue"}.}
+
+\item{edger_test}{edgeR only: \code{"LRT"} (likelihood-ratio test,
+\link[edgeR]{glmFit} and \link[edgeR]{glmLRT}; the default) or \code{"QL"}
+(quasi-likelihood F-test, \link[edgeR]{glmQLFit} and
+\link[edgeR]{glmQLFTest}, as the edgeR authors recommend for bulk RNA-seq).
+The default changes to \code{"QL"} in VISTA 1.4.0; until then, leaving it
+unset (or \code{NULL}) prints a notice. Set it explicitly to keep results
+stable.}
 }
 \value{
 A named list with components:
@@ -121,7 +130,8 @@ compatible with \code{VISTA}-based visualization and analysis.
 
 \itemize{
 \item For DESeq2, normalization is performed via \link[DESeq2]{DESeq}, and DE testing uses \link[DESeq2]{results}.
-\item For edgeR, normalization uses \link[edgeR]{calcNormFactors}, and testing uses \link[edgeR]{glmLRT}.
+\item For edgeR, normalization uses \link[edgeR]{calcNormFactors}, and testing uses
+\link[edgeR]{glmLRT} or, with \code{edger_test = "QL"}, \link[edgeR]{glmQLFTest}.
 \item For limma, normalization uses \link[edgeR]{calcNormFactors} + \link[limma]{voom},
 and testing uses \link[limma]{eBayes}.
 }
@@ -129,7 +139,14 @@ Low-abundance filtering is applied before model fitting, and for the
 edgeR/limma backends before \link[edgeR]{calcNormFactors} so that
 normalization factors are not estimated from genes that will be discarded.
 All three backends use the same filtering predicate: a gene is retained when
-at least \code{min_replicates} samples reach \code{min_counts}.
+at least \code{min_replicates} samples reach \code{min_counts}. Filtering is
+applied to the counts as given; DESeq2 then receives non-integer (estimated)
+counts rounded to the nearest integer, as \code{DESeqDataSetFromTximport()}
+does, with a message. Every backend refuses negative values and warns about
+non-integer values with an unmistakable sign of not being counts (every
+sample summing to exactly one million, or small, almost all fractional
+values). VISTA cannot otherwise verify that its input is counts: supply raw
+or estimated counts, not normalised values.
 Gene regulation status is determined via \code{.categorize_deg_results()} based on user thresholds.
 
 All output comparison results are internally standardized via \code{.tidy_de_results()} to ensure

@@ -4,7 +4,7 @@
 \alias{VISTA-deprecated}
 \title{Deprecated and defunct arguments in VISTA}
 \value{
-Not applicable; this page documents argument deprecations only.
+Not applicable; this page documents deprecations and default changes only.
 }
 \description{
 VISTA follows the Bioconductor deprecation contract: a renamed argument warns
@@ -14,8 +14,10 @@ Deprecated arguments keep working exactly as before while they warn.
 \details{
 The table below is generated from the package's internal registry, so it is
 always in sync with the code. Warnings are classed
-\code{c("vista_deprecated_arg", "deprecatedWarning")} and are emitted at most once
-per session per argument, so they will not flood a loop.
+\code{c("vista_deprecated_arg", "deprecatedWarning")} and are throttled so they
+will not flood a loop: by default each is shown at most once every eight
+hours per argument. Set \code{options(vista.deprecation_frequency = "once")} for
+once per session, or \code{"always"} to see every occurrence.
 
 To silence them while you migrate:
 \preformatted{
@@ -35,6 +37,21 @@ duplicated here, so it cannot drift out of date. Print it with the example
 below, or filter it to the function you are migrating.
 }
 
+\section{Defaults that will change}{
+
+A default that is going to change is announced one release ahead, so
+results do not move without warning. The old default stays in force until
+the release named in \code{changes_in}; until then, a call that relies on it (by
+not setting the argument, or passing \code{NULL}) prints a message classed
+\code{vista_default_change}, throttled like the warnings above.
+Setting the argument explicitly, to either value, keeps results stable
+across the change and silences the message. In VISTA 1.2.0 this applies to
+\code{edger_test}, which moves from \code{"LRT"} (likelihood-ratio test) to \code{"QL"}
+(quasi-likelihood F-test) in VISTA 1.4.0, in \code{\link[=create_vista]{create_vista()}},
+\code{\link[=run_edger_analysis]{run_edger_analysis()}}, \code{\link[=benchmark_vista_equivalence]{benchmark_vista_equivalence()}} and
+\code{\link[=validate_vista_deep]{validate_vista_deep()}}.
+}
+
 \examples{
 # The full table of deprecated arguments and their timelines
 VISTA:::.vista_deprecations()[, c("fun", "old_arg", "new_arg", "defunct_in")]
@@ -42,4 +59,7 @@ VISTA:::.vista_deprecations()[, c("fun", "old_arg", "new_arg", "defunct_in")]
 # Or just the one function you are migrating
 reg <- VISTA:::.vista_deprecations()
 reg[reg$fun == "get_corr_heatmap", c("old_arg", "new_arg", "defunct_in")]
+
+# Defaults that will change, and when
+VISTA:::.vista_default_changes()[, c("fun", "arg", "old_default", "new_default", "changes_in")]
 }

@@ -137,7 +137,7 @@ run_vista_report <- function(config, output_file = "vista-report.html") {
     if (length(missing_required) > 0) {
       cli::cli_abort("Missing required configuration fields: {.val {missing_required}}")
     }
-    vista_obj <- create_vista(
+    create_args <- list(
       counts = counts,
       sample_info = sample_info_df,
       column_geneid = cfg$column_geneid,
@@ -157,6 +157,10 @@ run_vista_report <- function(config, output_file = "vista-report.html") {
       result_source = cfg$de_source,
       group_palette = cfg$group_palette
     )
+    # Passed only when the config sets it, so a config relying on the default
+    # gets create_vista()'s notice that the default is changing.
+    if (!is.null(cfg$edger_test)) create_args$edger_test <- cfg$edger_test
+    vista_obj <- do.call(create_vista, create_args)
   }
 
   comps <- names(comparisons(vista_obj))
@@ -169,14 +173,28 @@ run_vista_report <- function(config, output_file = "vista-report.html") {
   obj_cuts <- cutoffs(vista_obj)
   param_source <- c(
     de_method = "config", log2fc_cutoff = "config",
-    pval_cutoff = "config", p_value_type = "config"
+    pval_cutoff = "config", p_value_type = "config", edger_test = "config"
   )
+  # Objects that ran edgeR but predate VISTA 1.1.6 do not record the test.
+  # create_vista() could then only run the likelihood-ratio test, and its
+  # objects carry its own cutoff fields; any other edgeR object without the
+  # field (e.g. from as_vista(), which wraps results made elsewhere) is
+  # reported as not recorded, rather than taking the config's word for it.
+  edger_test_inferred <- FALSE
+  if (length(obj_cuts) && as.character(obj_cuts$method %||% "") %in% c("edger", "both") &&
+      is.null(obj_cuts$edger_test)) {
+    made_before_116 <- is.null(S4Vectors::metadata(vista_obj)$provenance$vista_version)
+    from_create_vista <- all(c("min_replicates", "active_source") %in% names(obj_cuts))
+    edger_test_inferred <- made_before_116 && from_create_vista
+    obj_cuts$edger_test <- if (edger_test_inferred) "LRT" else "not recorded"
+  }
   if (length(obj_cuts)) {
     reconcile_map <- list(
       de_method = "method",
       log2fc_cutoff = "log2fc",
       pval_cutoff = "pval",
-      p_value_type = "p_value_type"
+      p_value_type = "p_value_type",
+      edger_test = "edger_test"
     )
     for (cfg_key in names(reconcile_map)) {
       stored <- obj_cuts[[reconcile_map[[cfg_key]]]]
@@ -191,6 +209,9 @@ run_vista_report <- function(config, output_file = "vista-report.html") {
       cfg[[cfg_key]] <- stored
       param_source[[cfg_key]] <- "object"
     }
+  }
+  if (edger_test_inferred) {
+    param_source[["edger_test"]] <- "object (inferred: made before VISTA 1.1.6)"
   }
 
   primary_comp <- cfg$primary_comparison %||% comps[[1]]
@@ -330,6 +351,14 @@ run_vista_report <- function(config, output_file = "vista-report.html") {
     ),
     stringsAsFactors = FALSE
   )
+  if (as.character(cfg$de_method) %in% c("edger", "both")) {
+    summary_tbl <- rbind(summary_tbl, data.frame(
+      metric = "edgeR test",
+      value = as.character(cfg$edger_test %||% "not recorded"),
+      source = param_source[["edger_test"]],
+      stringsAsFactors = FALSE
+    ))
+  }
 
   table_paths <- list()
   table_paths$summary <- write_table(summary_tbl, paste0("summary_", comp_tag, ".csv"))

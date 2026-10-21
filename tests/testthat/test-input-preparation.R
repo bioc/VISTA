@@ -486,3 +486,194 @@ test_that("duplicated identifiers with differing order are rejected", {
     "duplicated gene identifiers"
   )
 })
+
+test_that("tximport abundance and length are refused as counts", {
+  tx <- list(
+    counts = matrix(c(10, 20, 30, 40), 2, dimnames = list(c("g1", "g2"), c("a", "b"))),
+    abundance = matrix(1, 2, 2, dimnames = list(c("g1", "g2"), c("a", "b"))),
+    length = matrix(1000, 2, 2, dimnames = list(c("g1", "g2"), c("a", "b")))
+  )
+  expect_error(read_vista_counts(tx, format = "tximport", counts_from = "abundance", verbose = FALSE), "not a count matrix")
+  expect_error(read_vista_counts(tx, format = "tximport", counts_from = "length", verbose = FALSE), "not a count matrix")
+})
+
+test_that("unscaled tximport counts become length-scaled TPM counts", {
+  ids <- list(c("g1", "g2", "g3"), c("a", "b"))
+  counts <- matrix(c(100, 50, 10, 300, 40, 20), 3, dimnames = ids)
+  abundance <- matrix(c(10, 2, 1, 20, 1, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 4000, 2000, 1200, 3000, 2000), 3, dimnames = ids)
+  tx <- list(counts = counts, abundance = abundance, length = len, countsFromAbundance = "no")
+
+  expect_message(
+    cnt <- read_vista_counts(tx, format = "tximport", verbose = FALSE),
+    "lengthScaledTPM"
+  )
+  got <- as.matrix(cnt$counts[, c("a", "b")])
+  rownames(got) <- cnt$counts$gene_id
+
+  # By hand: abundance times the gene's mean length, rescaled to each sample's
+  # original estimated library size.
+  scaled <- abundance * rowMeans(len)
+  expected <- sweep(scaled, 2, colSums(counts) / colSums(scaled), "*")
+  expect_equal(got, expected[rownames(got), ])
+  expect_equal(colSums(got), colSums(counts))
+})
+
+test_that("length-scaled tximport counts are used as they are", {
+  ids <- list(c("g1", "g2"), c("a", "b"))
+  counts <- matrix(c(10.5, 20.25, 30, 40.75), 2, dimnames = ids)
+  tx <- list(counts = counts, abundance = counts, length = counts * 0 + 1000, countsFromAbundance = "lengthScaledTPM")
+  cnt <- read_vista_counts(tx, format = "tximport", verbose = FALSE)
+  expect_equal(unname(as.matrix(cnt$counts[, c("a", "b")])), unname(counts))
+})
+
+test_that("unscaled tximport counts without abundance or length warn", {
+  ids <- list(c("g1", "g2"), c("a", "b"))
+  tx <- list(counts = matrix(c(10, 20, 30, 40), 2, dimnames = ids), countsFromAbundance = "no")
+  expect_warning(read_vista_counts(tx, format = "tximport", verbose = FALSE), "without transcript-length correction")
+})
+
+test_that("transcript-level tximport input is summarised to genes as tximport does", {
+  ids <- list(c("t1", "t2", "t3"), c("a", "b"))
+  counts <- matrix(c(10, 30, 5, 0, 60, 8), 3, dimnames = ids)
+  abundance <- matrix(c(2, 3, 1, 0, 5, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 2000, 1500, 1100, 2100, 1500), 3, dimnames = ids)
+  tx2gene <- data.frame(tx = c("t1", "t2", "t3"), gene = c("G1", "G1", "G2"))
+  out <- VISTA:::.tximport_summarize_to_gene(counts, abundance, len, gene_ids = c("G1", "G1", "G2"))
+
+  # Gene length is the abundance-weighted mean of its transcripts' lengths.
+  expect_equal(out$length["G1", "a"], (2 * 1000 + 3 * 2000) / 5)
+  expect_equal(out$length["G1", "b"], (0 * 1100 + 5 * 2100) / 5)
+  expect_equal(out$counts["G1", ], c(a = 40, b = 60))
+
+  # A gene with no abundance in a sample takes the geometric mean of its
+  # lengths in the other samples.
+  abundance["t3", "b"] <- 0
+  out <- VISTA:::.tximport_summarize_to_gene(counts, abundance, len, gene_ids = c("G1", "G1", "G2"))
+  expect_equal(out$length["G2", "b"], 1500)
+})
+
+test_that("RSEM TPM and FPKM columns are refused as counts", {
+  rs <- data.frame(gene_id = c("a", "b"), expected_count = c(10.5, 3), TPM = c(1, 2), FPKM = c(1, 2))
+  expect_error(read_vista_counts(rs, format = "rsem", count_column = "TPM", verbose = FALSE), "not one of RSEM's count columns")
+  expect_error(read_vista_counts(rs, format = "rsem", count_column = "FPKM", verbose = FALSE), "not one of RSEM's count columns")
+})
+
+test_that("DESeq2 runs on estimated (non-integer) counts by rounding them", {
+  data("count_data", package = "VISTA", envir = environment())
+  data("sample_metadata", package = "VISTA", envir = environment())
+  cnt <- count_data[seq_len(300), c("gene_id", sample_metadata$sample_names)]
+  cnt[, -1] <- cnt[, -1] * 1.13
+  expect_message(
+    v <- create_vista(cnt, sample_metadata, "gene_id", "dex", "trt", "untrt", method = "deseq2", min_counts = 5),
+    "rounding the non-integer"
+  )
+  expect_true(all(counts(v) == round(counts(v))))
+})
+
+test_that("tximport abundance and length are matched to counts by name", {
+  ids <- list(c("g1", "g2", "g3"), c("a", "b"))
+  counts <- matrix(c(100, 50, 10, 300, 40, 20), 3, dimnames = ids)
+  abundance <- matrix(c(10, 2, 1, 20, 1, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 4000, 2000, 1200, 3000, 2000), 3, dimnames = ids)
+  ordered <- list(counts = counts, abundance = abundance, length = len, countsFromAbundance = "no")
+  shuffled <- ordered
+  shuffled$abundance <- abundance[c(3, 1, 2), c(2, 1)]
+  shuffled$length <- len[c(2, 3, 1), ]
+  a <- suppressMessages(read_vista_counts(ordered, format = "tximport", verbose = FALSE))$counts
+  b <- suppressMessages(read_vista_counts(shuffled, format = "tximport", verbose = FALSE))$counts
+  expect_equal(b[match(a$gene_id, b$gene_id), c("a", "b")], a[, c("a", "b")], ignore_attr = TRUE)
+
+  renamed <- ordered
+  rownames(renamed$abundance)[1] <- "other"
+  expect_error(read_vista_counts(renamed, format = "tximport", verbose = FALSE), "do not match")
+})
+
+test_that("tximport inputs that cannot be scaled are refused", {
+  ids <- list(c("g1", "g2"), c("a", "b"))
+  base <- list(
+    counts = matrix(c(10, 20, 30, 40), 2, dimnames = ids),
+    abundance = matrix(c(1, 2, 3, 4), 2, dimnames = ids),
+    length = matrix(1000, 2, 2, dimnames = ids),
+    countsFromAbundance = "no"
+  )
+  with_na <- base; with_na$abundance[1, 2] <- NA
+  expect_error(read_vista_counts(with_na, format = "tximport", verbose = FALSE), "missing, non-finite or negative")
+  zero <- base; zero$abundance[, 2] <- 0
+  expect_error(read_vista_counts(zero, format = "tximport", verbose = FALSE), "total abundance is zero")
+})
+
+test_that("a tx2gene that matches no transcript is a clear error", {
+  ids <- list(c("tx1", "tx2"), c("a", "b"))
+  tx <- list(
+    counts = matrix(c(10, 20, 30, 40), 2, dimnames = ids),
+    abundance = matrix(c(1, 2, 3, 4), 2, dimnames = ids),
+    length = matrix(1000, 2, 2, dimnames = ids),
+    countsFromAbundance = "no"
+  )
+  t2g <- data.frame(tx = c("tx1.1", "tx2.1"), gene = c("G", "G"))
+  expect_error(read_vista_counts(tx, format = "tximport", tx2gene = t2g, verbose = FALSE), "None of the transcript IDs")
+})
+
+test_that("scaled transcript-level counts are rebuilt at gene level, as summarizeToGene() does", {
+  ids <- list(c("t1", "t2", "t3"), c("a", "b"))
+  counts <- matrix(c(10, 30, 5, 2, 60, 8), 3, dimnames = ids)
+  abundance <- matrix(c(2, 3, 1, 1, 5, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 2000, 1500, 1100, 2100, 1500), 3, dimnames = ids)
+  tx <- list(counts = counts, abundance = abundance, length = len, countsFromAbundance = "lengthScaledTPM")
+  t2g <- data.frame(tx = c("t1", "t2", "t3"), gene = c("G1", "G1", "G2"))
+  got <- suppressMessages(read_vista_counts(tx, format = "tximport", tx2gene = t2g, verbose = FALSE))$counts
+  got <- as.matrix(got[, c("a", "b")]); rownames(got) <- c("G1", "G2")
+
+  g <- VISTA:::.tximport_summarize_to_gene(counts, abundance, len, c("G1", "G1", "G2"))
+  expected <- VISTA:::.tximport_length_scaled_counts(g$counts, g$abundance, g$length)
+  expect_equal(got, expected[rownames(got), ], ignore_attr = TRUE)
+  # Not the plain sum of the scaled transcript counts.
+  expect_false(isTRUE(all.equal(got["G1", ], colSums(counts[1:2, ]), check.attributes = FALSE)))
+})
+
+test_that("only RSEM count columns are accepted", {
+  rs <- data.frame(gene_id = c("a", "b"), expected_count = c(10.5, 3), posterior_mean_count = c(10, 3),
+                   pme_TPM = c(1, 2), TPM = c(1, 2))
+  expect_error(read_vista_counts(rs, format = "rsem", count_column = "pme_TPM", verbose = FALSE), "not one of RSEM's count columns")
+  expect_silent(read_vista_counts(rs, format = "rsem", count_column = "posterior_mean_count", verbose = FALSE))
+})
+
+test_that("an unrecognised countsFromAbundance value is refused", {
+  ids <- list(c("g1", "g2"), c("a", "b"))
+  tx <- list(counts = matrix(c(10, 20, 30, 40), 2, dimnames = ids), countsFromAbundance = "lengthscaledtpm")
+  expect_error(read_vista_counts(tx, format = "tximport", verbose = FALSE), "must be one of")
+})
+
+test_that("abundance and length named only by row are matched by row name", {
+  ids <- list(c("g1", "g2", "g3"), c("a", "b"))
+  counts <- matrix(c(100, 50, 10, 300, 40, 20), 3, dimnames = ids)
+  abundance <- matrix(c(10, 2, 1, 20, 1, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 4000, 2000, 1200, 3000, 2000), 3, dimnames = ids)
+  ref <- suppressMessages(read_vista_counts(list(counts = counts, abundance = abundance, length = len, countsFromAbundance = "no"),
+                                            format = "tximport", verbose = FALSE))$counts
+  shuffled_ab <- abundance[c(3, 1, 2), ]; colnames(shuffled_ab) <- NULL
+  shuffled_len <- len[c(2, 3, 1), ]; colnames(shuffled_len) <- NULL
+  got <- suppressMessages(read_vista_counts(list(counts = counts, abundance = shuffled_ab, length = shuffled_len, countsFromAbundance = "no"),
+                                            format = "tximport", verbose = FALSE))$counts
+  expect_equal(got, ref)
+})
+
+test_that("missing values only matter for transcripts that tx2gene keeps", {
+  ids <- list(c("t1", "t2", "t3"), c("a", "b"))
+  counts <- matrix(c(10, 30, 5, 2, 60, 8), 3, dimnames = ids)
+  abundance <- matrix(c(2, 3, NA, 1, 5, 2), 3, dimnames = ids)
+  len <- matrix(c(1000, 2000, 1500, 1100, 2100, 1500), 3, dimnames = ids)
+  tx <- list(counts = counts, abundance = abundance, length = len, countsFromAbundance = "no")
+  t2g <- data.frame(tx = c("t1", "t2"), gene = c("G1", "G1"))
+  cnt <- suppressMessages(read_vista_counts(tx, format = "tximport", tx2gene = t2g, verbose = FALSE))$counts
+  expect_identical(cnt$gene_id, "G1")
+  t2g_all <- data.frame(tx = c("t1", "t2", "t3"), gene = c("G1", "G1", "G2"))
+  expect_error(suppressMessages(read_vista_counts(tx, format = "tximport", tx2gene = t2g_all, verbose = FALSE)), "missing, non-finite")
+})
+
+test_that("a merged RSEM table is read from its named sample columns", {
+  merged <- data.frame(gene_id = c("a", "b"), s1 = c(10.5, 3), s2 = c(7, 1.25))
+  cnt <- read_vista_counts(merged, format = "rsem", sample_names = c("s1", "s2"), count_column = "s1", verbose = FALSE)
+  expect_equal(unname(as.matrix(cnt$counts[, c("s1", "s2")])), unname(as.matrix(merged[, c("s1", "s2")])))
+})

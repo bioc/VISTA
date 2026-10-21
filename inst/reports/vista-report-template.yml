@@ -53,6 +53,7 @@ p_value_type: padj
 covariates: []              # e.g. ["cell", "batch"]
 design_formula: null        # e.g. "~ cell + cond_long"
 consensus_mode: intersection # intersection or union (used when de_method = both)
+# edger_test: QL               # LRT or QL (edger/both). Unset uses LRT with a notice; QL becomes the default in VISTA 1.4.0
 consensus_log2fc: mean      # mean, deseq2, edger
 group_palette: "Dark 2"
 

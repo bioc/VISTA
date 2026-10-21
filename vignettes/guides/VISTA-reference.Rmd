@@ -38,6 +38,9 @@ Arguments:
 - `p_value_type`: `"padj"` or `"pvalue"` (for `create_vista()` this controls DE calling across all methods).
 - `covariates`: Optional additive covariate columns from `sample_info`.
 - `design_formula`: Optional explicit design formula including `group_column`.
+- `edger_test`: For `method = "edger"` or `"both"`, `"LRT"` (likelihood-ratio
+  test; current default) or `"QL"` (quasi-likelihood F-test; default from VISTA
+  1.4.0). Set it explicitly to keep results stable.
 - `consensus_mode`: For `method = "both"`, `"intersection"` or `"union"`.
 - `consensus_log2fc`: For consensus tables, how `log2fc` is populated.
 - `result_source`: Active DE source (`"consensus"`, `"deseq2"`, `"edger"`, `"limma"`).
@@ -87,7 +90,8 @@ Arguments:
 # DE wrappers
 
 - `run_deseq_analysis(...)`: DESeq2 pipeline; arguments mirror `create_vista()`.
-- `run_edger_analysis(...)`: edgeR pipeline; arguments mirror `create_vista()`.
+- `run_edger_analysis(...)`: edgeR pipeline; arguments mirror `create_vista()`,
+  including `edger_test`.
 - `run_limma_analysis(...)`: limma-voom pipeline; arguments mirror `create_vista()`.
 
 # Expression matrices

@@ -212,6 +212,12 @@ validate_vista(vista2, level = "full")
 
 ## Alternative: Using edgeR backend
 
+edgeR can test with the likelihood-ratio test (`edger_test = "LRT"`, the
+current default) or the quasi-likelihood F-test (`edger_test = "QL"`), which
+the edgeR authors recommend for bulk RNA-seq. The default becomes `"QL"` in
+VISTA 1.4.0, so set it explicitly to keep results stable; see
+`` ?`VISTA-deprecated` ``. The test used is recorded in `cutoffs()`.
+
 ```{r create-vista-edger}
 # Create VISTA object with edgeR backend
 vista_edger <- create_vista(
@@ -222,6 +228,7 @@ vista_edger <- create_vista(
   group_numerator = "Dexamethasone",
   group_denominator = "Untreated",
   method = "edger",  # Use edgeR instead of DESeq2
+  edger_test = "QL", # quasi-likelihood F-test
   min_counts = 10,
   min_replicates = 2,
   log2fc_cutoff = 1.0,
@@ -230,6 +237,7 @@ vista_edger <- create_vista(
 )
 
 vista_edger
+cutoffs(vista_edger)$edger_test
 ```
 
 ## Alternative: Using limma-voom backend
@@ -306,6 +314,7 @@ vista_both <- create_vista(
   group_numerator = "Dexamethasone",
   group_denominator = "Untreated",
   method = "both",
+  edger_test = "QL",
   consensus_mode = "intersection",  # or "union"
   result_source = "consensus"       # or "deseq2"/"edger"
 )

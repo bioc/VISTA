@@ -36,7 +36,10 @@
     group_denominator = "control",
     min_counts = 5,
     min_replicates = 1,
-    method = method
+    method = method,
+    # Set explicitly: callers of example_vista() cannot choose the edgeR test,
+    # so they should not be told its default is changing.
+    edger_test = "LRT"
   )
 }
 

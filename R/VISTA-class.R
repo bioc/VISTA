@@ -10,7 +10,10 @@
 #'   \item \code{$de_summary}: named \code{SimpleList} of DEG summary tables.
 #'   \item \code{$de_cutoffs}: named list of thresholds (log2FC, p-value type/cutoff, method settings).
 #'   \item \code{$group}: list with \code{column}, \code{palette}, \code{colors} describing the grouping/fill scheme.
-#'   \item \code{$provenance}: list with constructor version, timestamp, session info.
+#'   \item \code{$provenance}: list with the constructor, a timestamp
+#'     (\code{created_at}), the VISTA and R versions, and the installed DESeq2,
+#'     edgeR and limma versions (\code{engine_versions}); subsetting and
+#'     \code{updateObject()} append \code{subset_history} and \code{updates}.
 #'   \item \code{$vista_schema_version}: metadata schema tag used for compatibility checks.
 #' }
 #' Feature-level annotations live in \code{rowData(v)}, sample metadata in
@@ -329,7 +332,14 @@ as_vista <- function(se,
     ),
     provenance = list(
       constructor = ".vista()",
-      created_at = as.character(Sys.time())
+      created_at = as.character(Sys.time()),
+      vista_version = as.character(utils::packageVersion("VISTA")),
+      r_version = R.version.string,
+      engine_versions = vapply(
+        c("DESeq2", "edgeR", "limma"),
+        function(pkg) as.character(utils::packageVersion(pkg)),
+        character(1)
+      )
     ),
     vista_schema_version = .VISTA_SCHEMA_VERSION
   )

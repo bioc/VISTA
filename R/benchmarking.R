@@ -1,8 +1,47 @@
 #' Benchmark VISTA against standalone differential-expression backends
 #'
-#' Run VISTA and direct DESeq2, edgeR, and limma pipelines with matched
-#' preprocessing, contrast definitions, and DEG thresholds, then compare the
-#' resulting tables, DEG calls, normalized matrices, and critical plot inputs.
+#' Run VISTA and independent DESeq2, edgeR, and limma pipelines with the same
+#' filtering, design, contrast definitions, and DEG thresholds, then compare
+#' the retained genes, normalized matrices, every numeric column the engine
+#' reports, DEG calls, and critical plot inputs.
+#'
+#' @details
+#' The reference pipelines are written independently of the code they check.
+#' They call only base R, \pkg{stats} and the engines' own functions -- never
+#' VISTA's internal helpers -- and re-implement VISTA's documented contract
+#' from scratch:
+#'
+#' * **Samples** are matched to count columns by a `sample_names` column, else
+#'   by non-default rownames, else by the first of `sample_name`, `sample`,
+#'   `sample_id`, `Run`, `run`, `Sample` and `SampleName` whose values name
+#'   count columns (the rule documented for `sample_info` in [create_vista()]).
+#' * **Filtering** treats missing counts as zero and keeps genes whose total
+#'   reaches `min_counts` and that reach `min_counts` in at least
+#'   `min_replicates` samples. For DESeq2, non-integer counts (estimated counts
+#'   from tximport or RSEM) are then rounded, as DESeq2 requires.
+#' * **Tests** are DESeq2's Wald test via `results()`, edgeR's `glmLRT()` or,
+#'   with `edger_test = "QL"`, `glmQLFit()` and `glmQLFTest()`, and limma's
+#'   `eBayes()` after `voom()`.
+#' * **Design** is `~ covariates + group` for DESeq2 and the same terms without
+#'   an intercept for edgeR and limma-voom, or `design_formula` when supplied.
+#' * **Contrasts** for edgeR and limma are the difference between the design
+#'   rows of two samples that differ only in group, so they do not depend on
+#'   how design columns are named or which level is the reference.
+#' * **DEG calls** are `Up` when log2FC >= `log2fc_cutoff` and the selected
+#'   p-value <= `pval_cutoff`, `Down` symmetrically, and `Other` otherwise,
+#'   including when the engine reports no p-value.
+#'
+#' VISTA's DE tables and normalized counts are read through its exported
+#' accessors ([comparisons()], [norm_counts()]). The MA, PCA and DEG-count
+#' checks read the data [get_ma_plot()], [get_pca_plot()] and the DEG-count
+#' plots draw; the volcano check rebuilds its inputs from the stored table.
+#' Rows are matched by gene identifier, not position, and the set of
+#' comparisons must agree as well. A
+#' defect in sample matching, design construction, contrast signs, DEG calling
+#' or row alignment therefore shows up as a mismatch instead of being
+#' reproduced on both sides. The two sides share only the engines and the
+#' contract above: the benchmark checks that VISTA runs DESeq2, edgeR and limma
+#' faithfully, not that those packages are correct.
 #'
 #' @param counts Raw counts (matrix/data.frame) with a gene-id column and sample columns.
 #' @param sample_info Data frame with sample metadata.
@@ -12,8 +51,10 @@
 #' @param group_denominator Character vector of denominator groups.
 #' @param methods Character vector of backends to benchmark. Any subset of
 #'   `c("deseq2", "edger", "limma")`.
-#' @param min_counts Minimum total counts per gene to retain.
-#' @param min_replicates Minimum samples per group meeting filtering criteria.
+#' @param min_counts Minimum count a gene must reach in a sample to count as
+#'   detected there; also the minimum row total.
+#' @param min_replicates Minimum number of samples, across the whole
+#'   experiment, in which a gene must reach `min_counts`.
 #' @param log2fc_cutoff Absolute log2 fold-change threshold for DEG calling.
 #' @param pval_cutoff P-value (or adjusted p-value) threshold.
 #' @param p_value_type Either `"padj"` or `"pvalue"`.
@@ -22,11 +63,18 @@
 #' @param tolerance Numeric tolerance used for floating-point comparisons.
 #' @param return_plots Logical; if `TRUE`, return paired VISTA/reference plots
 #'   for MA, volcano, DEG count, and PCA views.
+#' @param edger_test The edgeR test, `"LRT"` (the default until VISTA 1.4.0) or
+#'   `"QL"`; see [create_vista()]. VISTA and the reference both use it.
 #'
 #' @return A list with fields `valid`, `comparison_summary`, `visual_summary`,
-#'   and `methods`. Each element of `methods` contains the VISTA object, direct
-#'   backend results, structural validation output, self-consistency checks, and
-#'   optional plot objects.
+#'   and `methods`. `comparison_summary` has one row per method and comparison
+#'   recording whether the retained gene set, normalized counts, every numeric
+#'   column the engine reports (`columns_compared`), regulation calls and DEG
+#'   sets agree, with the largest absolute difference for the main columns. A
+#'   `*_within_tolerance` field is `NA` when the engine does not report that
+#'   column (edgeR reports `logCPM`, not `baseMean`). Each element of `methods`
+#'   contains the VISTA object, the reference results, structural validation
+#'   output, self-consistency checks, and optional plot objects.
 #' @examples
 #' v <- example_vista()
 #' si <- as.data.frame(sample_info(v))
@@ -86,16 +134,14 @@ benchmark_vista_equivalence <- function(counts,
                                         covariates = NULL,
                                         design_formula = NULL,
                                         tolerance = 1e-8,
-                                        return_plots = FALSE) {
+                                        return_plots = FALSE,
+                                        edger_test = c("LRT", "QL")) {
   methods <- match.arg(methods, c("deseq2", "edger", "limma"), several.ok = TRUE)
   p_value_type <- match.arg(p_value_type, c("padj", "pvalue"))
-  design_formula <- .coerce_design_formula(design_formula)
-  sample_info <- .normalize_sample_info(
-    sample_info = sample_info,
-    counts = counts,
-    column_geneid = column_geneid
-  )
-  covariates <- .validate_covariates(sample_info, group_column, covariates)
+  if ((missing(edger_test) || is.null(edger_test)) && "edger" %in% methods) {
+    .vista_default_change_notice("benchmark_vista_equivalence", "edger_test")
+  }
+  edger_test <- match.arg(edger_test)
 
   method_results <- stats::setNames(vector("list", length(methods)), methods)
   comparison_summary <- vector("list", length(methods))
@@ -104,6 +150,8 @@ benchmark_vista_equivalence <- function(counts,
   for (i in seq_along(methods)) {
     method <- methods[[i]]
 
+    # Both sides receive the inputs exactly as the user supplied them; neither
+    # sees the other's preprocessing.
     vista_obj <- create_vista(
       counts = counts,
       sample_info = sample_info,
@@ -119,7 +167,8 @@ benchmark_vista_equivalence <- function(counts,
       p_value_type = p_value_type,
       covariates = covariates,
       design_formula = design_formula,
-      validate = TRUE
+      validate = TRUE,
+      edger_test = edger_test
     )
 
     reference <- .run_reference_backend(
@@ -136,7 +185,8 @@ benchmark_vista_equivalence <- function(counts,
       min_replicates = min_replicates,
       log2fc_cutoff = log2fc_cutoff,
       pval_cutoff = pval_cutoff,
-      p_value_type = p_value_type
+      p_value_type = p_value_type,
+      edger_test = edger_test
     )
 
     structural_validation <- validate_vista(vista_obj, level = "full", error = FALSE)
@@ -264,7 +314,13 @@ validate_vista_deep <- function(counts,
                                 design_formula = NULL,
                                 tolerance = 1e-8,
                                 return_plots = FALSE,
-                                error = TRUE) {
+                                error = TRUE,
+                                edger_test = c("LRT", "QL")) {
+  methods <- match.arg(methods, c("deseq2", "edger", "limma"), several.ok = TRUE)
+  if ((missing(edger_test) || is.null(edger_test)) && "edger" %in% methods) {
+    .vista_default_change_notice("validate_vista_deep", "edger_test")
+  }
+  edger_test <- match.arg(edger_test)
   report <- benchmark_vista_equivalence(
     counts = counts,
     sample_info = sample_info,
@@ -281,7 +337,8 @@ validate_vista_deep <- function(counts,
     covariates = covariates,
     design_formula = design_formula,
     tolerance = tolerance,
-    return_plots = return_plots
+    return_plots = return_plots,
+    edger_test = edger_test
   )
 
   if (!report$valid) {
@@ -319,10 +376,13 @@ validate_vista_deep <- function(counts,
     apply(failed, 1, function(row) {
       paste0(
         row[["method"]], " / ", row[["comparison"]], ": ",
-        "regulation_identical=", row[["regulation_identical"]],
+        "comparison_sets_identical=", row[["comparison_sets_identical"]],
+        ", gene_sets_identical=", row[["gene_sets_identical"]],
+        ", regulation_identical=", row[["regulation_identical"]],
         ", deg_sets_identical=", row[["deg_sets_identical"]],
         ", norm_counts_identical=", row[["norm_counts_identical"]],
-        ", baseMean_within_tolerance=", row[["baseMean_within_tolerance"]],
+        ", all_columns_within_tolerance=", row[["all_columns_within_tolerance"]],
+        " (", row[["columns_compared"]], ")",
         ", log2fc_within_tolerance=", row[["log2fc_within_tolerance"]],
         ", pvalue_within_tolerance=", row[["pvalue_within_tolerance"]],
         ", padj_within_tolerance=", row[["padj_within_tolerance"]]
@@ -347,6 +407,15 @@ validate_vista_deep <- function(counts,
   }
 }
 
+# Independent reference pipelines --------------------------------------------
+#
+# Nothing in this section may call VISTA's analysis helpers: sample matching,
+# design construction, contrasts, DEG calling, or table standardisation and
+# alignment. A reference that shared that code would reproduce any defect in
+# it, and the comparison would pass. Only base R, stats and the engines' own
+# functions are used; the documented contract is re-implemented here from
+# scratch (see the Details of ?benchmark_vista_equivalence).
+
 #' @keywords internal
 .run_reference_backend <- function(method,
                                    counts,
@@ -361,346 +430,302 @@ validate_vista_deep <- function(counts,
                                    min_replicates = 1,
                                    log2fc_cutoff = 1,
                                    pval_cutoff = 0.05,
-                                   p_value_type = "padj") {
-  switch(
+                                   p_value_type = "padj",
+                                   edger_test = "LRT") {
+  if (method %in% c("edger", "limma") && !requireNamespace("edgeR", quietly = TRUE)) {
+    cli::cli_abort("Package {.pkg edgeR} is required for {method} benchmarking.")
+  }
+  if (identical(method, "limma") && !requireNamespace("limma", quietly = TRUE)) {
+    cli::cli_abort("Package {.pkg limma} is required for limma benchmarking.")
+  }
+
+  inputs <- .reference_inputs(
+    counts = counts,
+    sample_info = sample_info,
+    column_geneid = column_geneid,
+    group_column = group_column,
+    covariates = covariates,
+    design_formula = design_formula,
+    min_counts = min_counts,
+    min_replicates = min_replicates,
+    intercept = identical(method, "deseq2"),
+    round_counts = identical(method, "deseq2")
+  )
+  fit <- switch(
     method,
-    deseq2 = .run_reference_deseq2(
-      counts = counts,
-      sample_info = sample_info,
-      column_geneid = column_geneid,
-      group_column = group_column,
-      group_numerator = group_numerator,
-      group_denominator = group_denominator,
-      covariates = covariates,
-      design_formula = design_formula,
-      min_counts = min_counts,
-      min_replicates = min_replicates,
+    deseq2 = .reference_fit_deseq2(inputs),
+    edger = .reference_fit_edger(inputs, edger_test = edger_test),
+    limma = .reference_fit_limma(inputs)
+  )
+
+  comparisons <- list()
+  for (i in seq_along(group_numerator)) {
+    num <- as.character(group_numerator[[i]])
+    den <- as.character(group_denominator[[i]])
+    if (identical(num, den)) {
+      next
+    }
+    tbl <- fit$test(num, den)
+    tbl$regulation <- .reference_regulation(
+      log2fc = tbl$log2fc,
+      p = tbl[[p_value_type]],
       log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = p_value_type
-    ),
-    edger = .run_reference_edger(
-      counts = counts,
-      sample_info = sample_info,
-      column_geneid = column_geneid,
-      group_column = group_column,
-      group_numerator = group_numerator,
-      group_denominator = group_denominator,
-      covariates = covariates,
-      design_formula = design_formula,
-      min_counts = min_counts,
-      min_replicates = min_replicates,
-      log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = if (identical(p_value_type, "padj")) "FDR" else "PValue"
-    ),
-    limma = .run_reference_limma(
-      counts = counts,
-      sample_info = sample_info,
-      column_geneid = column_geneid,
-      group_column = group_column,
-      group_numerator = group_numerator,
-      group_denominator = group_denominator,
-      covariates = covariates,
-      design_formula = design_formula,
-      min_counts = min_counts,
-      min_replicates = min_replicates,
-      log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = if (identical(p_value_type, "padj")) "FDR" else "PValue"
+      pval_cutoff = pval_cutoff
     )
+    comparisons[[paste(num, den, sep = "_VS_")]] <- tbl
+  }
+
+  deg_summary <- lapply(comparisons, function(tbl) {
+    data.frame(
+      regulation = c("Up", "Down"),
+      n = c(sum(tbl$regulation == "Up"), sum(tbl$regulation == "Down")),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  list(
+    norm_counts = fit$norm_counts,
+    sample_info = inputs$col_data,
+    group_column = group_column,
+    comparisons = comparisons,
+    deg_summary = deg_summary
   )
 }
 
 #' @keywords internal
-.prepare_reference_inputs <- function(counts,
-                                      sample_info,
-                                      column_geneid,
-                                      group_column,
-                                      covariates = NULL,
-                                      design_formula = NULL,
-                                      min_counts = 10,
-                                      backend = c("deseq2", "edger", "limma")) {
-  backend <- match.arg(backend)
+.reference_sample_ids <- function(sample_info, count_columns) {
+  if ("sample_names" %in% names(sample_info)) {
+    return(as.character(sample_info$sample_names))
+  }
+  rn <- rownames(sample_info)
+  if (!is.null(rn) && !identical(rn, as.character(seq_len(nrow(sample_info))))) {
+    return(as.character(rn))
+  }
+  # Otherwise the first of the documented ID columns (see ?create_vista,
+  # `sample_info`) whose values name count columns.
+  documented <- c("sample_name", "sample", "sample_id", "Run", "run", "Sample", "SampleName")
+  for (nm in intersect(documented, names(sample_info))) {
+    v <- as.character(sample_info[[nm]])
+    if (!anyNA(v) && all(nzchar(v)) && !anyDuplicated(v) && all(v %in% count_columns)) {
+      return(v)
+    }
+  }
+  cli::cli_abort(c(
+    "Cannot match {.arg sample_info} rows to count columns.",
+    "i" = "Add a {.field sample_names} column naming each sample's count column."
+  ))
+}
 
-  count_data <- counts |>
-    dplyr::select(tidyselect::all_of(c(column_geneid, sample_info$sample_names))) |>
-    as.data.frame(stringsAsFactors = FALSE) |>
-    tibble::as_tibble() |>
-    tibble::column_to_rownames(column_geneid)
-  count_data[is.na(count_data)] <- 0
-  count_data <- count_data[rowSums(count_data) >= min_counts, , drop = FALSE]
+#' @keywords internal
+.reference_inputs <- function(counts,
+                              sample_info,
+                              column_geneid,
+                              group_column,
+                              covariates = NULL,
+                              design_formula = NULL,
+                              min_counts = 10,
+                              min_replicates = 1,
+                              intercept = TRUE,
+                              round_counts = FALSE) {
+  counts <- as.data.frame(counts, stringsAsFactors = FALSE)
+  sample_info <- as.data.frame(sample_info, stringsAsFactors = FALSE)
+  ids <- .reference_sample_ids(sample_info, setdiff(names(counts), column_geneid))
+  if (anyNA(ids) || anyDuplicated(ids) || !all(ids %in% names(counts))) {
+    cli::cli_abort("Sample identifiers must be unique and name columns of {.arg counts}.")
+  }
+  genes <- as.character(counts[[column_geneid]])
+  if (anyNA(genes) || anyDuplicated(genes)) {
+    cli::cli_abort("Gene identifiers in {.field {column_geneid}} must be unique and non-missing.")
+  }
 
-  col_data <- sample_info |>
-    as.data.frame(stringsAsFactors = FALSE) |>
-    tibble::as_tibble() |>
-    tibble::column_to_rownames("sample_names")
+  mat <- as.matrix(counts[, ids, drop = FALSE])
+  storage.mode(mat) <- "double"
+  mat[is.na(mat)] <- 0
+  dimnames(mat) <- list(genes, ids)
+  keep <- rowSums(mat) >= min_counts & rowSums(mat >= min_counts) >= min_replicates
+  mat <- mat[keep, , drop = FALSE]
+  if (round_counts) {
+    mat <- round(mat)
+  }
+
+  col_data <- sample_info
+  col_data$sample_names <- NULL
+  rownames(col_data) <- ids
   col_data[[group_column]] <- factor(col_data[[group_column]])
 
-  design_formula <- .resolve_design_formula(
-    sample_info = col_data,
-    group_column = group_column,
-    covariates = covariates,
-    design_formula = design_formula,
-    backend = backend
-  )
+  if (is.null(design_formula)) {
+    terms <- unique(c(setdiff(covariates, group_column), group_column))
+    design_formula <- stats::reformulate(terms, intercept = intercept)
+  } else {
+    if (is.character(design_formula)) {
+      design_formula <- stats::as.formula(design_formula)
+    }
+    if (!intercept && attr(stats::terms(design_formula), "intercept") == 1L) {
+      design_formula <- stats::update(design_formula, ~ . - 1)
+    }
+  }
 
-  design_vars <- intersect(all.vars(design_formula), colnames(col_data))
-  for (vv in design_vars) {
+  vars <- all.vars(design_formula)
+  if (!group_column %in% vars) {
+    cli::cli_abort("{.arg design_formula} must include {.field {group_column}}.")
+  }
+  if (!all(vars %in% names(col_data))) {
+    cli::cli_abort("Design variables missing from {.arg sample_info}: {.val {setdiff(vars, names(col_data))}}")
+  }
+  for (vv in vars) {
     if (is.character(col_data[[vv]])) {
       col_data[[vv]] <- factor(col_data[[vv]])
     }
   }
 
   list(
-    count_data = count_data,
+    counts = mat,
     col_data = col_data,
-    design_formula = design_formula
+    design_formula = design_formula,
+    group_column = group_column
   )
 }
 
 #' @keywords internal
-.run_reference_deseq2 <- function(counts,
-                                  sample_info,
-                                  column_geneid,
-                                  group_column,
-                                  group_numerator,
-                                  group_denominator,
-                                  covariates = NULL,
-                                  design_formula = NULL,
-                                  min_counts = 10,
-                                  min_replicates = 1,
-                                  log2fc_cutoff = 1,
-                                  pval_cutoff = 0.05,
-                                  p_value_type = "padj") {
-  inputs <- .prepare_reference_inputs(
-    counts = counts,
-    sample_info = sample_info,
-    column_geneid = column_geneid,
-    group_column = group_column,
-    covariates = covariates,
-    design_formula = design_formula,
-    min_counts = min_counts,
-    backend = "deseq2"
-  )
+.reference_contrast <- function(inputs, design, numerator, denominator) {
+  # The design built with every sample in the numerator group, minus the
+  # design with every sample in the denominator group, all other columns as
+  # observed: each row of the difference is the numerator-minus-denominator
+  # contrast, whatever the coding or the reference level. Covariate terms that
+  # depend on the data (factor(), scale(), cut(), I(x / sd(x))) see the same
+  # values as in the fit, so they evaluate exactly as they did there.
+  col_data <- inputs$col_data
+  group <- inputs$group_column
+  lv <- levels(col_data[[group]])
+  if (!all(c(numerator, denominator) %in% lv)) {
+    cli::cli_abort("Groups {.val {setdiff(c(numerator, denominator), lv)}} are not levels of {.field {group}}.")
+  }
+  all_in <- function(level) {
+    d <- col_data
+    d[[group]] <- factor(rep(level, nrow(d)), levels = lv)
+    stats::model.matrix(inputs$design_formula, data = d)
+  }
+  rows <- all_in(numerator) - all_in(denominator)
+  if (!identical(colnames(rows), colnames(design))) {
+    cli::cli_abort("Could not rebuild the design columns for the {numerator} vs {denominator} contrast.")
+  }
+  # Additive designs give the same contrast for every sample; a difference
+  # between rows would mean the group effect depends on the covariates.
+  if (any(abs(sweep(rows, 2, rows[1L, ])) > 1e-12)) {
+    cli::cli_abort("The {numerator} vs {denominator} contrast depends on covariates; only additive designs are supported.")
+  }
+  rows[1L, ]
+}
 
+#' @keywords internal
+.reference_regulation <- function(log2fc, p, log2fc_cutoff, pval_cutoff) {
+  sig <- !is.na(log2fc) & !is.na(p) & p <= pval_cutoff
+  ifelse(
+    sig & log2fc >= log2fc_cutoff, "Up",
+    ifelse(sig & log2fc <= -log2fc_cutoff, "Down", "Other")
+  )
+}
+
+#' @keywords internal
+.reference_fit_deseq2 <- function(inputs) {
   dds <- DESeq2::DESeqDataSetFromMatrix(
-    countData = as.matrix(inputs$count_data),
+    countData = inputs$counts,
     colData = inputs$col_data,
     design = inputs$design_formula
   )
-  dds <- dds[rowSums(DESeq2::counts(dds) >= min_counts) >= min_replicates, ]
-  dds <- DESeq2::DESeq(dds)
-  norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+  dds <- DESeq2::DESeq(dds, quiet = TRUE)
 
-  comparisons <- list()
-  deg_summary <- list()
-  for (i in seq_along(group_numerator)) {
-    num <- group_numerator[[i]]
-    den <- group_denominator[[i]]
-    if (identical(num, den)) {
-      next
-    }
-
-    res <- DESeq2::results(dds, contrast = c(group_column, num, den))
-    categorized <- .categorize_deg_results(
-      de_results = res,
-      log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = p_value_type
+  test <- function(num, den) {
+    res <- DESeq2::results(dds, contrast = c(inputs$group_column, num, den))
+    data.frame(
+      gene_id = rownames(res),
+      baseMean = res$baseMean,
+      log2fc = res$log2FoldChange,
+      lfcSE = res$lfcSE,
+      stat = res$stat,
+      pvalue = res$pvalue,
+      padj = res$padj,
+      row.names = rownames(res),
+      stringsAsFactors = FALSE
     )
-    comp_name <- paste(num, den, sep = "_VS_")
-    comparisons[[comp_name]] <- categorized
-    deg_summary[[comp_name]] <- categorized |>
-      dplyr::count(.data$regulation)
   }
 
-  list(
-    norm_counts = norm_counts,
-    sample_info = as.data.frame(SummarizedExperiment::colData(dds), stringsAsFactors = FALSE),
-    row_data = S4Vectors::DataFrame(
-      baseMean = rowMeans(norm_counts),
-      row.names = rownames(norm_counts)
-    ),
-    comparisons = comparisons,
-    deg_summary = deg_summary
-  )
+  list(norm_counts = DESeq2::counts(dds, normalized = TRUE), test = test)
 }
 
 #' @keywords internal
-.run_reference_edger <- function(counts,
-                                 sample_info,
-                                 column_geneid,
-                                 group_column,
-                                 group_numerator,
-                                 group_denominator,
-                                 covariates = NULL,
-                                 design_formula = NULL,
-                                 min_counts = 10,
-                                 min_replicates = 1,
-                                 log2fc_cutoff = 1,
-                                 pval_cutoff = 0.05,
-                                 p_value_type = "FDR") {
-  if (!requireNamespace("edgeR", quietly = TRUE)) {
-    cli::cli_abort("Package {.pkg edgeR} is required for edgeR benchmarking.")
-  }
-
-  inputs <- .prepare_reference_inputs(
-    counts = counts,
-    sample_info = sample_info,
-    column_geneid = column_geneid,
-    group_column = group_column,
-    covariates = covariates,
-    design_formula = design_formula,
-    min_counts = min_counts,
-    backend = "edger"
-  )
-
-  dge <- edgeR::DGEList(counts = inputs$count_data, group = inputs$col_data[[group_column]])
-  keep <- rowSums(dge$counts >= min_counts) >= min_replicates
-  dge <- dge[keep, , keep.lib.sizes = FALSE]
-  dge <- edgeR::calcNormFactors(dge)
-
+.reference_fit_edger <- function(inputs, edger_test = "LRT") {
   design <- stats::model.matrix(inputs$design_formula, data = inputs$col_data)
-  dge <- edgeR::estimateDisp(dge, design)
-  fit <- edgeR::glmFit(dge, design)
-  norm_counts <- edgeR::cpm(dge, normalized.lib.sizes = TRUE)
-
-  comparisons <- list()
-  deg_summary <- list()
-  for (i in seq_along(group_numerator)) {
-    num <- group_numerator[[i]]
-    den <- group_denominator[[i]]
-    if (identical(num, den)) {
-      next
-    }
-
-    contrast_vector <- .edgeR_group_contrast(
-      design_colnames = colnames(design),
-      group_column = group_column,
-      numerator = num,
-      denominator = den
-    )
-    lrt <- edgeR::glmLRT(fit, contrast = contrast_vector)
-    res <- edgeR::topTags(lrt, n = Inf)$table
-    res$gene_id <- rownames(res)
-
-    categorized <- .categorize_deg_results(
-      de_results = res,
-      log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = p_value_type
-    )
-    comp_name <- paste(num, den, sep = "_VS_")
-    comparisons[[comp_name]] <- categorized
-    deg_summary[[comp_name]] <- categorized |>
-      dplyr::count(.data$regulation)
+  dge <- edgeR::DGEList(counts = inputs$counts, group = inputs$col_data[[inputs$group_column]])
+  dge <- edgeR::calcNormFactors(dge)
+  if (identical(edger_test, "QL")) {
+    # edgeR v4 quasi-likelihood pipeline, as the edgeR user's guide runs it.
+    fit <- edgeR::glmQLFit(dge, design)
+    run_test <- function(contrast) edgeR::glmQLFTest(fit, contrast = contrast)
+    stat_col <- "F"
+  } else {
+    dge <- edgeR::estimateDisp(dge, design)
+    fit <- edgeR::glmFit(dge, design)
+    run_test <- function(contrast) edgeR::glmLRT(fit, contrast = contrast)
+    stat_col <- "LR"
   }
 
-  list(
-    norm_counts = norm_counts,
-    sample_info = inputs$col_data,
-    row_data = S4Vectors::DataFrame(
-      baseMean = rowMeans(norm_counts),
-      row.names = rownames(norm_counts)
-    ),
-    comparisons = comparisons,
-    deg_summary = deg_summary
-  )
+  test <- function(num, den) {
+    contrast <- .reference_contrast(inputs, design, num, den)
+    tab <- edgeR::topTags(run_test(contrast), n = Inf, sort.by = "none")$table
+    data.frame(
+      gene_id = rownames(tab),
+      log2fc = tab$logFC,
+      logCPM = tab$logCPM,
+      stat = tab[[stat_col]],
+      pvalue = tab$PValue,
+      padj = tab$FDR,
+      row.names = rownames(tab),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  list(norm_counts = edgeR::cpm(dge), test = test)
 }
 
 #' @keywords internal
-.run_reference_limma <- function(counts,
-                                 sample_info,
-                                 column_geneid,
-                                 group_column,
-                                 group_numerator,
-                                 group_denominator,
-                                 covariates = NULL,
-                                 design_formula = NULL,
-                                 min_counts = 10,
-                                 min_replicates = 1,
-                                 log2fc_cutoff = 1,
-                                 pval_cutoff = 0.05,
-                                 p_value_type = "FDR") {
-  if (!requireNamespace("limma", quietly = TRUE)) {
-    cli::cli_abort("Package {.pkg limma} is required for limma benchmarking.")
-  }
-  if (!requireNamespace("edgeR", quietly = TRUE)) {
-    cli::cli_abort("Package {.pkg edgeR} is required for limma benchmarking.")
-  }
-
-  inputs <- .prepare_reference_inputs(
-    counts = counts,
-    sample_info = sample_info,
-    column_geneid = column_geneid,
-    group_column = group_column,
-    covariates = covariates,
-    design_formula = design_formula,
-    min_counts = min_counts,
-    backend = "limma"
-  )
-
-  dge <- edgeR::DGEList(counts = inputs$count_data)
-  keep <- rowSums(dge$counts >= min_counts) >= min_replicates
-  dge <- dge[keep, , keep.lib.sizes = FALSE]
-  dge <- edgeR::calcNormFactors(dge)
-
+.reference_fit_limma <- function(inputs) {
   design <- stats::model.matrix(inputs$design_formula, data = inputs$col_data)
-  v <- limma::voom(dge, design = design, plot = FALSE)
-  fit <- limma::lmFit(v, design)
-  norm_counts <- edgeR::cpm(dge, normalized.lib.sizes = TRUE)
+  dge <- edgeR::calcNormFactors(edgeR::DGEList(counts = inputs$counts))
+  fit <- limma::lmFit(limma::voom(dge, design = design, plot = FALSE), design)
 
-  comparisons <- list()
-  deg_summary <- list()
-  for (i in seq_along(group_numerator)) {
-    num <- group_numerator[[i]]
-    den <- group_denominator[[i]]
-    if (identical(num, den)) {
-      next
-    }
-
-    contrast_vector <- .edgeR_group_contrast(
-      design_colnames = colnames(design),
-      group_column = group_column,
-      numerator = num,
-      denominator = den
-    )
-    contrast_matrix <- matrix(
-      contrast_vector,
+  test <- function(num, den) {
+    contrast <- matrix(
+      .reference_contrast(inputs, design, num, den),
       ncol = 1,
       dimnames = list(colnames(design), "contrast")
     )
-    fit2 <- limma::contrasts.fit(fit, contrasts = contrast_matrix)
-    fit2 <- limma::eBayes(fit2)
-    res <- limma::topTable(fit2, coef = 1, number = Inf, sort.by = "none")
-    res$gene_id <- rownames(res)
-    res$PValue <- res$P.Value
-    res$FDR <- res$adj.P.Val
-
-    categorized <- .categorize_deg_results(
-      de_results = res,
-      log2fc_cutoff = log2fc_cutoff,
-      pval_cutoff = pval_cutoff,
-      p_value_type = p_value_type
+    fit2 <- limma::eBayes(limma::contrasts.fit(fit, contrasts = contrast))
+    tab <- limma::topTable(fit2, coef = 1, number = Inf, sort.by = "none")
+    data.frame(
+      gene_id = rownames(tab),
+      baseMean = tab$AveExpr,
+      log2fc = tab$logFC,
+      stat = tab$t,
+      pvalue = tab$P.Value,
+      padj = tab$adj.P.Val,
+      B = tab$B,
+      # VISTA's limma tables keep limma's own names beside pvalue/padj.
+      P.Value = tab$P.Value,
+      adj.P.Val = tab$adj.P.Val,
+      row.names = rownames(tab),
+      stringsAsFactors = FALSE
     )
-    comp_name <- paste(num, den, sep = "_VS_")
-    comparisons[[comp_name]] <- categorized
-    deg_summary[[comp_name]] <- categorized |>
-      dplyr::count(.data$regulation)
   }
 
-  list(
-    norm_counts = norm_counts,
-    sample_info = inputs$col_data,
-    row_data = S4Vectors::DataFrame(
-      baseMean = rowMeans(norm_counts),
-      row.names = rownames(norm_counts)
-    ),
-    comparisons = comparisons,
-    deg_summary = deg_summary
-  )
+  list(norm_counts = edgeR::cpm(dge), test = test)
 }
+
+# Comparison ------------------------------------------------------------------
+#
+# VISTA is read through its exported accessors, and every match between the
+# two sides is by identifier. Positional comparison would let a label/value
+# misalignment on VISTA's side pass whenever both tables share an order.
 
 #' @keywords internal
 .compare_vista_and_reference <- function(vista_obj,
@@ -713,13 +738,12 @@ validate_vista_deep <- function(counts,
                                          return_plots = FALSE) {
   vista_norm <- as.matrix(norm_counts(vista_obj))
   ref_norm <- as.matrix(reference$norm_counts)
-  ref_norm <- ref_norm[rownames(vista_norm), colnames(vista_norm), drop = FALSE]
+  gene_sets_identical <- nrow(vista_norm) == nrow(ref_norm) &&
+    setequal(rownames(vista_norm), rownames(ref_norm))
   norm_check <- .compare_numeric_matrix(vista_norm, ref_norm, tolerance = tolerance)
 
   vista_comps <- comparisons(vista_obj)
-  ref_comps <- reference$comparisons
-  comp_names <- intersect(names(vista_comps), names(ref_comps))
-  ref_rn <- rownames(vista_norm)
+  comp_names <- names(reference$comparisons)
 
   comparison_rows <- vector("list", length(comp_names))
   visual_rows <- vector("list", length(comp_names) + 2L)
@@ -727,41 +751,42 @@ validate_vista_deep <- function(counts,
 
   for (i in seq_along(comp_names)) {
     comp_name <- comp_names[[i]]
-    vista_tbl <- .align_de_to_counts(
-      df = .tidy_de_results(vista_comps[[comp_name]], rowname_col = "gene_id"),
-      ref_rn = ref_rn,
-      warn_missing = FALSE
-    )
-    ref_tbl <- .align_de_to_counts(
-      df = .tidy_de_results(ref_comps[[comp_name]], rowname_col = "gene_id"),
-      ref_rn = ref_rn,
-      warn_missing = FALSE
-    )
+    has_comp <- comp_name %in% names(vista_comps)
 
-    comp_check <- .compare_de_tables(
-      vista_tbl = vista_tbl,
-      ref_tbl = ref_tbl,
+    comparison_rows[[i]] <- .compare_de_tables(
+      vista_tbl = if (has_comp) vista_comps[[comp_name]] else NULL,
+      ref_tbl = reference$comparisons[[comp_name]],
       method = method,
       comparison = comp_name,
       norm_check = norm_check,
+      gene_sets_identical = gene_sets_identical,
       tolerance = tolerance
-    )
-    comparison_rows[[i]] <- comp_check$summary
+    )$summary
+
+    if (!has_comp) {
+      missing_row <- tibble::tibble(
+        method = method,
+        comparison = comp_name,
+        visual = c("ma", "volcano"),
+        pass = FALSE,
+        detail = "comparison missing from VISTA object"
+      )
+      visual_rows[[i]] <- missing_row[1, ]
+      visual_rows[[length(comp_names) + i]] <- missing_row[2, ]
+      next
+    }
 
     visual_rows[[i]] <- .compare_visual_payload(
-      vista_obj = vista_obj,
-      reference = reference,
       method = method,
       comparison = comp_name,
       visual = "ma",
       vista_df = .ma_payload_from_vista(vista_obj, comp_name),
       ref_df = .ma_payload_from_reference(reference, comp_name),
+      key = "gene_id",
       tolerance = tolerance
     )
 
     visual_rows[[length(comp_names) + i]] <- .compare_visual_payload(
-      vista_obj = vista_obj,
-      reference = reference,
       method = method,
       comparison = comp_name,
       visual = "volcano",
@@ -779,6 +804,7 @@ validate_vista_deep <- function(counts,
         log2fc_cutoff = log2fc_cutoff,
         pval_cutoff = pval_cutoff
       ),
+      key = "gene_id",
       tolerance = tolerance
     )
 
@@ -811,23 +837,21 @@ validate_vista_deep <- function(counts,
   }
 
   visual_rows[[length(comp_names) * 2 + 1L]] <- .compare_visual_payload(
-    vista_obj = vista_obj,
-    reference = reference,
     method = method,
     comparison = NA_character_,
     visual = "deg_count",
     vista_df = .deg_count_payload_from_vista(vista_obj),
     ref_df = .deg_count_payload_from_reference(reference),
+    key = c("sample_comparisons", "regulation"),
     tolerance = tolerance
   )
   visual_rows[[length(comp_names) * 2 + 2L]] <- .compare_visual_payload(
-    vista_obj = vista_obj,
-    reference = reference,
     method = method,
     comparison = NA_character_,
     visual = "pca",
     vista_df = .pca_payload_from_vista(vista_obj),
     ref_df = .pca_payload_from_reference(reference, vista_obj),
+    key = "sample",
     tolerance = tolerance,
     allow_sign_flip = TRUE
   )
@@ -843,8 +867,16 @@ validate_vista_deep <- function(counts,
     )
   }
 
+  # A comparison VISTA holds that the reference never asked for is a mismatch
+  # too, not something to skip.
+  comparison_summary <- dplyr::bind_rows(comparison_rows) |>
+    dplyr::mutate(
+      comparison_sets_identical = setequal(names(vista_comps), comp_names),
+      all_checks_pass = .data$all_checks_pass & .data$comparison_sets_identical
+    )
+
   list(
-    comparison_summary = dplyr::bind_rows(comparison_rows),
+    comparison_summary = comparison_summary,
     visual_summary = dplyr::bind_rows(visual_rows),
     plots = plot_bundle
   )
@@ -856,65 +888,121 @@ validate_vista_deep <- function(counts,
                                method,
                                comparison,
                                norm_check,
+                               gene_sets_identical,
                                tolerance = 1e-8) {
-  base_check <- .compare_numeric_vectors(vista_tbl$baseMean, ref_tbl$baseMean, tolerance = tolerance)
-  log2fc_check <- .compare_numeric_vectors(vista_tbl$log2fc, ref_tbl$log2fc, tolerance = tolerance)
-  pvalue_check <- .compare_numeric_vectors(vista_tbl$pvalue, ref_tbl$pvalue, tolerance = tolerance)
-  padj_check <- .compare_numeric_vectors(vista_tbl$padj, ref_tbl$padj, tolerance = tolerance)
+  # Every numeric column the engine reports is compared, not just the four
+  # that feed the summary fields.
+  value_cols <- setdiff(names(ref_tbl), c("gene_id", "regulation"))
 
-  vista_reg <- as.character(vista_tbl$regulation)
-  ref_reg <- as.character(ref_tbl$regulation)
-  regulation_identical <- identical(vista_reg, ref_reg)
-  up_identical <- identical(
-    vista_tbl$gene_id[vista_reg == "Up"],
-    ref_tbl$gene_id[ref_reg == "Up"]
-  )
-  down_identical <- identical(
-    vista_tbl$gene_id[vista_reg == "Down"],
-    ref_tbl$gene_id[ref_reg == "Down"]
-  )
+  vista_tbl <- if (is.null(vista_tbl)) {
+    data.frame(gene_id = character(), stringsAsFactors = FALSE)
+  } else {
+    as.data.frame(vista_tbl, stringsAsFactors = FALSE)
+  }
+  vista_ids <- if ("gene_id" %in% names(vista_tbl)) {
+    as.character(vista_tbl$gene_id)
+  } else {
+    rownames(vista_tbl)
+  }
+  idx <- match(ref_tbl$gene_id, vista_ids)
+  rows_matched <- !anyNA(idx) && nrow(vista_tbl) == nrow(ref_tbl)
+
+  checks <- lapply(value_cols, function(col) {
+    if (!rows_matched || !col %in% names(vista_tbl)) {
+      return(list(identical = FALSE, max_abs_diff = Inf))
+    }
+    .compare_numeric_vectors(vista_tbl[[col]][idx], ref_tbl[[col]], tolerance = tolerance)
+  })
+  names(checks) <- value_cols
+  # A numeric column VISTA reports that the reference does not cannot be
+  # checked, so it counts against the comparison rather than being skipped.
+  vista_numeric <- names(vista_tbl)[vapply(vista_tbl, is.numeric, logical(1))]
+  unchecked <- setdiff(vista_numeric, value_cols)
+  for (col in unchecked) {
+    checks[[col]] <- list(identical = FALSE, max_abs_diff = Inf)
+  }
+  within <- function(col) if (col %in% value_cols) checks[[col]]$identical else NA
+  max_diff <- function(col) if (col %in% value_cols) checks[[col]]$max_abs_diff else NA_real_
+  all_columns <- all(vapply(checks, `[[`, logical(1), "identical"))
+
+  vista_reg <- if ("regulation" %in% names(vista_tbl)) as.character(vista_tbl$regulation) else character(nrow(vista_tbl))
+  regulation_identical <- rows_matched && identical(vista_reg[idx], as.character(ref_tbl$regulation))
+  up_identical <- setequal(vista_ids[vista_reg %in% "Up"], ref_tbl$gene_id[ref_tbl$regulation %in% "Up"])
+  down_identical <- setequal(vista_ids[vista_reg %in% "Down"], ref_tbl$gene_id[ref_tbl$regulation %in% "Down"])
+  gene_sets <- gene_sets_identical && rows_matched
 
   summary <- tibble::tibble(
     method = method,
     comparison = comparison,
-    n_genes = nrow(vista_tbl),
+    n_genes = nrow(ref_tbl),
+    gene_sets_identical = gene_sets,
     up_genes_identical = up_identical,
     down_genes_identical = down_identical,
     deg_sets_identical = up_identical && down_identical,
     regulation_identical = regulation_identical,
     norm_counts_identical = norm_check$identical,
-    baseMean_within_tolerance = base_check$identical,
-    log2fc_within_tolerance = log2fc_check$identical,
-    pvalue_within_tolerance = pvalue_check$identical,
-    padj_within_tolerance = padj_check$identical,
+    baseMean_within_tolerance = within("baseMean"),
+    log2fc_within_tolerance = within("log2fc"),
+    pvalue_within_tolerance = within("pvalue"),
+    padj_within_tolerance = within("padj"),
+    all_columns_within_tolerance = all_columns,
+    columns_compared = paste(value_cols, collapse = ","),
+    columns_not_in_reference = paste(unchecked, collapse = ","),
     max_abs_norm_counts_diff = norm_check$max_abs_diff,
-    max_abs_baseMean_diff = base_check$max_abs_diff,
-    max_abs_log2fc_diff = log2fc_check$max_abs_diff,
-    max_abs_pvalue_diff = pvalue_check$max_abs_diff,
-    max_abs_padj_diff = padj_check$max_abs_diff,
-    all_checks_pass = regulation_identical &&
+    max_abs_baseMean_diff = max_diff("baseMean"),
+    max_abs_log2fc_diff = max_diff("log2fc"),
+    max_abs_pvalue_diff = max_diff("pvalue"),
+    max_abs_padj_diff = max_diff("padj"),
+    all_checks_pass = gene_sets &&
+      regulation_identical &&
       up_identical &&
       down_identical &&
       norm_check$identical &&
-      base_check$identical &&
-      log2fc_check$identical &&
-      pvalue_check$identical &&
-      padj_check$identical
+      all_columns
   )
 
   list(summary = summary)
 }
 
 #' @keywords internal
-.compare_visual_payload <- function(vista_obj,
-                                    reference,
-                                    method,
+.compare_visual_payload <- function(method,
                                     comparison,
                                     visual,
                                     vista_df,
                                     ref_df,
+                                    key,
                                     tolerance = 1e-8,
                                     allow_sign_flip = FALSE) {
+  # A column the reference draws that VISTA's payload lacks is a mismatch, not
+  # something to skip. Columns only VISTA carries are not compared.
+  missing_cols <- setdiff(names(ref_df), names(vista_df))
+  if (length(missing_cols)) {
+    return(tibble::tibble(
+      method = method,
+      comparison = if (is.na(comparison)) NA_character_ else comparison,
+      visual = visual,
+      pass = FALSE,
+      detail = paste0("missing from VISTA: ", paste(missing_cols, collapse = ", "))
+    ))
+  }
+  key_of <- function(df) do.call(paste, c(lapply(df[key], as.character), sep = "\r"))
+  vista_keys <- key_of(vista_df)
+  ref_keys <- key_of(ref_df)
+  # Keys must identify rows on both sides; a duplicate could hide a row of the
+  # other side from the comparison.
+  idx <- match(vista_keys, ref_keys)
+  if (anyNA(idx) || nrow(vista_df) != nrow(ref_df) ||
+      anyDuplicated(vista_keys) || anyDuplicated(ref_keys)) {
+    return(tibble::tibble(
+      method = method,
+      comparison = if (is.na(comparison)) NA_character_ else comparison,
+      visual = visual,
+      pass = FALSE,
+      detail = "rows differ between VISTA and reference"
+    ))
+  }
+  ref_df <- ref_df[idx, , drop = FALSE]
+
   if (allow_sign_flip) {
     ref_df <- .align_pca_signs(vista_df, ref_df)
   }
@@ -940,10 +1028,7 @@ validate_vista_deep <- function(counts,
   numeric_identical <- all(vapply(numeric_checks, `[[`, logical(1), "identical"))
   max_abs_diff <- 0
   if (length(numeric_checks)) {
-    max_abs_diff <- max(vapply(numeric_checks, `[[`, numeric(1), "max_abs_diff"), na.rm = TRUE)
-    if (!is.finite(max_abs_diff)) {
-      max_abs_diff <- 0
-    }
+    max_abs_diff <- max(vapply(numeric_checks, `[[`, numeric(1), "max_abs_diff"))
   }
 
   detail <- if (numeric_identical && non_numeric_identical) {
@@ -969,32 +1054,45 @@ validate_vista_deep <- function(counts,
 .compare_numeric_vectors <- function(x, y, tolerance = 1e-8) {
   x <- as.numeric(x)
   y <- as.numeric(y)
-  both_na <- is.na(x) & is.na(y)
-  equal <- both_na | (is.finite(x) & is.finite(y) & abs(x - y) <= tolerance)
-  equal[is.na(equal)] <- FALSE
-
-  diff <- abs(x - y)
-  diff[both_na] <- 0
-  diff[!is.finite(diff)] <- Inf
-  max_abs_diff <- suppressWarnings(max(diff, na.rm = TRUE))
-  if (!is.finite(max_abs_diff)) {
-    max_abs_diff <- 0
+  if (length(x) != length(y)) {
+    return(list(identical = FALSE, max_abs_diff = Inf))
   }
+  both_na <- is.na(x) & is.na(y)
+  same <- !is.na(x) & !is.na(y) & x == y
+  close <- is.finite(x) & is.finite(y) & abs(x - y) <= tolerance
+  equal <- both_na | same | close
+
+  # NA against a value, or an infinity against anything else, is reported as
+  # an infinite difference rather than hidden as 0.
+  diff <- ifelse(both_na | same, 0, abs(x - y))
+  diff[is.na(diff)] <- Inf
 
   list(
     identical = all(equal),
-    max_abs_diff = max_abs_diff
+    max_abs_diff = if (length(diff)) max(diff) else 0
   )
 }
 
 #' @keywords internal
 .compare_numeric_matrix <- function(x, y, tolerance = 1e-8) {
-  check <- .compare_numeric_vectors(as.vector(x), as.vector(y), tolerance = tolerance)
-  list(
-    identical = check$identical &&
-      identical(rownames(x), rownames(y)) &&
-      identical(colnames(x), colnames(y)),
-    max_abs_diff = check$max_abs_diff
+  # Matched by dimnames: equal values in a different gene order must pass, and
+  # equal-looking values under the wrong labels must not.
+  labelled <- function(m) {
+    !is.null(rownames(m)) && !is.null(colnames(m)) &&
+      !anyDuplicated(rownames(m)) && !anyDuplicated(colnames(m))
+  }
+  if (!labelled(x) || !labelled(y)) {
+    return(list(identical = FALSE, max_abs_diff = Inf))
+  }
+  ri <- match(rownames(y), rownames(x))
+  ci <- match(colnames(y), colnames(x))
+  if (anyNA(ri) || anyNA(ci) || nrow(x) != nrow(y) || ncol(x) != ncol(y)) {
+    return(list(identical = FALSE, max_abs_diff = Inf))
+  }
+  .compare_numeric_vectors(
+    as.vector(x[ri, ci, drop = FALSE]),
+    as.vector(y),
+    tolerance = tolerance
   )
 }
 
@@ -1066,38 +1164,31 @@ validate_vista_deep <- function(counts,
 
 #' @keywords internal
 .ma_payload_from_vista <- function(x, comparison) {
-  tbl <- .align_de_to_counts(
-    df = .tidy_de_results(comparisons(x)[[comparison]], rowname_col = "gene_id"),
-    ref_rn = rownames(norm_counts(x)),
-    warn_missing = FALSE
+  # Read from what get_ma_plot() draws, not re-derived from the stored table,
+  # so a defect in the plot function's own data handling is caught too.
+  pd <- as.data.frame(get_ma_plot(x, sample_comparison = comparison)$data, stringsAsFactors = FALSE)
+  data.frame(
+    gene_id = as.character(pd$gene_id),
+    baseMean = pd$baseMean,
+    log10_baseMean = pd$log10_baseMean,
+    log2fc = pd$log2fc,
+    regulation = as.character(pd$regulation),
+    stringsAsFactors = FALSE
   )
-  tbl$baseMean <- rowMeans(norm_counts(x))[match(tbl$gene_id, rownames(norm_counts(x)))]
-  tbl |>
-    dplyr::transmute(
-      gene_id = .data$gene_id,
-      baseMean = .data$baseMean,
-      log10_baseMean = log10(.data$baseMean + 1),
-      log2fc = .data$log2fc,
-      regulation = as.character(.data$regulation)
-    )
 }
 
 #' @keywords internal
 .ma_payload_from_reference <- function(reference, comparison) {
-  tbl <- .align_de_to_counts(
-    df = .tidy_de_results(reference$comparisons[[comparison]], rowname_col = "gene_id"),
-    ref_rn = rownames(reference$norm_counts),
-    warn_missing = FALSE
+  tbl <- reference$comparisons[[comparison]]
+  base_mean <- unname(rowMeans(reference$norm_counts)[tbl$gene_id])
+  data.frame(
+    gene_id = tbl$gene_id,
+    baseMean = base_mean,
+    log10_baseMean = log10(base_mean + 1),
+    log2fc = tbl$log2fc,
+    regulation = tbl$regulation,
+    stringsAsFactors = FALSE
   )
-  tbl$baseMean <- rowMeans(reference$norm_counts)[match(tbl$gene_id, rownames(reference$norm_counts))]
-  tbl |>
-    dplyr::transmute(
-      gene_id = .data$gene_id,
-      baseMean = .data$baseMean,
-      log10_baseMean = log10(.data$baseMean + 1),
-      log2fc = .data$log2fc,
-      regulation = as.character(.data$regulation)
-    )
 }
 
 #' @keywords internal
@@ -1120,12 +1211,19 @@ validate_vista_deep <- function(counts,
                                             p_value_type = "padj",
                                             log2fc_cutoff = 1,
                                             pval_cutoff = 0.05) {
-  tbl <- .align_de_to_counts(
-    df = .tidy_de_results(reference$comparisons[[comparison]], rowname_col = "gene_id"),
-    ref_rn = rownames(reference$norm_counts),
-    warn_missing = FALSE
+  tbl <- reference$comparisons[[comparison]]
+  p_vals <- tbl[[p_value_type]]
+  # The volcano draws a gene the engine did not test at p = 1.
+  p_vals[!is.finite(p_vals)] <- 1
+  data.frame(
+    gene_id = tbl$gene_id,
+    log2fc = tbl$log2fc,
+    pvalue = p_vals,
+    neg_log10_p = -log10(p_vals + 1e-300),
+    significant = abs(tbl$log2fc) >= log2fc_cutoff & p_vals <= pval_cutoff,
+    regulation = tbl$regulation,
+    stringsAsFactors = FALSE
   )
-  .volcano_payload_from_table(tbl, p_value_type, log2fc_cutoff, pval_cutoff)
 }
 
 #' @keywords internal
@@ -1155,17 +1253,21 @@ validate_vista_deep <- function(counts,
 
 #' @keywords internal
 .deg_count_payload_from_reference <- function(reference) {
-  df <- purrr::imap_dfr(reference$deg_summary, function(tbl, comp_name) {
-    as.data.frame(tbl, stringsAsFactors = FALSE) |>
-      dplyr::filter(.data$regulation %in% c("Up", "Down")) |>
-      dplyr::transmute(
-        sample_comparisons = comp_name,
-        regulation = as.character(.data$regulation),
-        n = as.numeric(.data$n)
-      )
+  # Built here rather than through .standardize_deg_count_payload(), which
+  # formats VISTA's side: shared formatting could drop the same rows on both.
+  rows <- lapply(names(reference$deg_summary), function(comp_name) {
+    tbl <- reference$deg_summary[[comp_name]]
+    data.frame(
+      sample_comparisons = comp_name,
+      regulation = c("Up", "Down"),
+      n = c(sum(tbl$n[tbl$regulation == "Up"]), sum(tbl$n[tbl$regulation == "Down"])),
+      stringsAsFactors = FALSE
+    )
   })
-
-  .standardize_deg_count_payload(df)
+  if (!length(rows)) {
+    return(data.frame(sample_comparisons = character(), regulation = character(), n = numeric()))
+  }
+  do.call(rbind, rows)
 }
 
 #' @keywords internal
@@ -1210,33 +1312,32 @@ validate_vista_deep <- function(counts,
 
 #' @keywords internal
 .pca_payload_from_vista <- function(x) {
-  mat <- norm_counts(x)
-  meta <- as.data.frame(SummarizedExperiment::colData(x), stringsAsFactors = FALSE)
-  meta$sample <- meta$sample_names
-  pca <- stats::prcomp(t(mat), center = TRUE, scale. = TRUE)
-  .prepare_pca_dataframe(pca, meta) |>
-    dplyr::select("sample", "PC1", "PC2", tidyselect::everything()) |>
-    dplyr::arrange(.data$sample)
+  # Read from what get_pca_plot() draws with its defaults.
+  pd <- as.data.frame(get_pca_plot(x)$data, stringsAsFactors = FALSE)
+  pd[order(pd$sample), , drop = FALSE]
 }
 
 #' @keywords internal
 .pca_payload_from_reference <- function(reference, vista_obj) {
+  # As get_pca_plot() documents: normalized counts, genes with any variance,
+  # centred and scaled.
   mat <- as.matrix(reference$norm_counts)
-  meta <- as.data.frame(reference$sample_info, stringsAsFactors = FALSE)
-  if (!"sample_names" %in% names(meta)) {
-    meta$sample_names <- rownames(meta)
-  }
-  meta$sample <- meta$sample_names
+  mat <- mat[apply(mat, 1, stats::var) > 0, , drop = FALSE]
   pca <- stats::prcomp(t(mat), center = TRUE, scale. = TRUE)
-  pca_df <- .prepare_pca_dataframe(pca, meta) |>
-    dplyr::select("sample", "PC1", "PC2", tidyselect::everything()) |>
-    dplyr::arrange(.data$sample)
-
-  vista_group <- tryCatch(S4Vectors::metadata(vista_obj)$group$column, error = function(e) NULL)
-  if (!is.null(vista_group) && vista_group %in% names(pca_df)) {
-    pca_df[[vista_group]] <- as.character(pca_df[[vista_group]])
+  samples <- rownames(pca$x)
+  pca_df <- data.frame(
+    sample = samples,
+    PC1 = unname(pca$x[, 1]),
+    PC2 = unname(pca$x[, 2]),
+    stringsAsFactors = FALSE
+  )
+  # Every sample-sheet column, not only the group: the plots annotate and
+  # colour by them, so they are compared against VISTA's colData too.
+  meta <- as.data.frame(reference$sample_info, stringsAsFactors = FALSE)[samples, , drop = FALSE]
+  for (col in setdiff(names(meta), names(pca_df))) {
+    pca_df[[col]] <- as.character(meta[[col]])
   }
-  pca_df
+  pca_df[order(pca_df$sample), , drop = FALSE]
 }
 
 #' @keywords internal

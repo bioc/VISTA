@@ -109,26 +109,13 @@ test_that("consensus p-values stay continuous and conservative", {
   expect_lt(mean(tbl$padj == 1, na.rm = TRUE), 0.5)
   expect_lt(mean(tbl$pvalue == 1, na.rm = TRUE), 0.5)
 
-  # Genes not uniquely called by one backend carry the less-significant value.
-  shared <- tbl$support %in% c("both", "discordant", "none")
-  expect_equal(
-    tbl$padj[shared],
-    pmax(tbl$padj_deseq2, tbl$padj_edger)[shared]
-  )
-  expect_equal(
-    tbl$pvalue[shared],
-    pmax(tbl$pvalue_deseq2, tbl$pvalue_edger)[shared]
-  )
-
-  # Single-backend calls keep the contributing backend's value.
-  d_only <- tbl$support == "deseq2_only"
-  if (any(d_only)) {
-    expect_equal(tbl$padj[d_only], tbl$padj_deseq2[d_only])
-  }
-  e_only <- tbl$support == "edger_only"
-  if (any(e_only)) {
-    expect_equal(tbl$padj[e_only], tbl$padj_edger[e_only])
-  }
+  # In the default intersection mode a single-backend gene is not a call, so
+  # every gene carries the less-significant value (an untested gene counts as
+  # p = 1). Union mode, where single-backend genes are calls, is tested in
+  # test-consensus.R.
+  no_evidence <- function(p) replace(p, is.na(p), 1)
+  expect_equal(tbl$padj, pmax(no_evidence(tbl$padj_deseq2), no_evidence(tbl$padj_edger)))
+  expect_equal(tbl$pvalue, pmax(no_evidence(tbl$pvalue_deseq2), no_evidence(tbl$pvalue_edger)))
 
   # Per-backend columns must survive intact.
   expect_true(all(

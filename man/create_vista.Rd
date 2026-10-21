@@ -25,14 +25,28 @@ create_vista(
   group_palette = "Dark 2",
   comparison_palette = "Dark 3",
   keep_raw_counts = TRUE,
-  validate = TRUE
+  validate = TRUE,
+  edger_test = c("LRT", "QL")
 )
 }
 \arguments{
-\item{counts}{Raw counts (matrix/data.frame) with a gene-id column and sample columns.}
+\item{counts}{Raw counts (matrix/data.frame) with a gene-id column and sample columns.
+Estimated (non-integer) counts, e.g. from tximport or RSEM via
+\code{\link[=read_vista_counts]{read_vista_counts()}}, are accepted and rounded for DESeq2 after filtering.
+Negative values are refused, and non-integer values summing to exactly one
+million per sample (TPM/CPM) or small and almost all fractional (log scale)
+draw a warning. VISTA cannot otherwise tell normalised values from counts,
+so supply raw or estimated counts.}
 
-\item{sample_info}{Data frame with sample metadata. Must contain \code{sample_names}
-(or have rownames equal to sample columns in \code{counts}) and the \code{group_column}.}
+\item{sample_info}{Data frame with sample metadata, including the
+\code{group_column}. Samples are matched to count columns by a
+\code{sample_names} column. Without one, the rownames are used if they are
+unique and are not the default \code{1, 2, ...}; they are then used as they
+are and must name count columns, so reset the rownames of a row-subsetted
+sheet with \code{rownames(x) <- NULL}. If neither is available, the first
+of \code{sample_name}, \code{sample}, \code{sample_id}, \code{Run},
+\code{run}, \code{Sample} and \code{SampleName} whose values name count
+columns is used.}
 
 \item{column_geneid}{Column name in \code{counts} that contains gene identifiers.}
 
@@ -84,11 +98,20 @@ comparison (stored in \code{metadata(v)$comparison$colors}). Defaults to \code{"
 
 \item{keep_raw_counts}{Logical; if \code{TRUE} (default), the filtered raw
 count matrix is retained as a second assay named \code{"counts"}, reachable
-with \code{counts(v)} and required by \code{as_deseq_dataset()}. This
+with \code{counts(v)} and required by \code{as_deseq_dataset()}. For the
+DESeq2 backend these are the rounded counts DESeq2 analysed. This
 roughly doubles the assay footprint; set \code{FALSE} to omit it.}
 
 \item{validate}{Logical; if \code{TRUE} (default), run full \code{validate_vista()}
 checks before returning the object.}
+
+\item{edger_test}{For \code{method = "edger"} or \code{"both"}, the edgeR test:
+\code{"LRT"} (likelihood-ratio test; the default) or \code{"QL"}
+(quasi-likelihood F-test, which the edgeR authors recommend for bulk RNA-seq
+and which is less liberal with few replicates). The default changes to
+\code{"QL"} in VISTA 1.4.0; until then, a call that runs edgeR without
+setting it (or with \code{NULL}) prints a notice. The test used is recorded
+in \code{cutoffs(v)$edger_test}.}
 }
 \value{
 A \code{VISTA} object:
@@ -118,10 +141,16 @@ When \code{method = "both"}, method-specific and consensus DE tables are stored 
 \code{metadata(v)$de_results_by_method} and \code{metadata(v)$de_summary_by_method},
 and the active source is tracked in \code{metadata(v)$de_active_source}.
 
-In the consensus table, \code{log2fc} follows \code{consensus_log2fc} (with
-single-backend calls taking the contributing backend's estimate), while
+In the consensus table, \code{log2fc} follows \code{consensus_log2fc}, while
 \code{pvalue} and \code{padj} carry the less-significant of the two backends
-so the columns remain continuous and usable for volcano/MA plots and ranking.
+(a gene a backend did not test counts as \code{p = 1}) so the columns remain
+continuous and usable for volcano/MA plots and ranking. With
+\code{consensus_mode = "union"}, genes called by a single backend take that
+backend's estimate and p-values instead, so every called gene's columns
+agree with its call. The merged \code{padj} is a conservative ranking score,
+not an FDR-adjusted p-value of the consensus, and \code{regulation} is the
+call: in simulations the intersection lowered, but did not control, the
+false discovery rate of the single backends, and the union raised it.
 Per-backend values are always preserved alongside them in
 \code{log2fc_deseq2}, \code{log2fc_edger}, \code{pvalue_deseq2},
 \code{pvalue_edger}, \code{padj_deseq2}, and \code{padj_edger}, and the

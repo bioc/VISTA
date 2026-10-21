@@ -113,6 +113,7 @@ vista_edger <- create_vista(
   group_numerator   = "trt",
   group_denominator = "untrt",
   method        = "edger",
+  edger_test    = "QL",   # quasi-likelihood F-test; the default from VISTA 1.4.0
   log2fc_cutoff = 1,
   pval_cutoff   = 0.05,
   min_counts    = 10,
@@ -619,9 +620,12 @@ cat("Fold-change Pearson r:", round(r_val, 3), "\n")
    discordant genes (unique to one method) often reveals marginal significance
    in the other method as well.
 
-5. **For robust results**, consider requiring DEGs to be called by both methods,
-   or use the intersection as a high-confidence set and the union as a
-   discovery set.
+5. **Agreement is not calibration**. Requiring both methods to call a gene
+   (`method = "both"`, intersection) flags genes the engines agree on and
+   lowers the false-discovery rate somewhat, but in simulations it did not
+   restore nominal FDR control where the engines exceeded it, and the union
+   raised the false-discovery rate. Treat the consensus as a convenience,
+   not as a more reliable test; see `?create_vista`.
 
 # Session Info
 

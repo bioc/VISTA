@@ -21,7 +21,8 @@ validate_vista_deep(
   design_formula = NULL,
   tolerance = 1e-08,
   return_plots = FALSE,
-  error = TRUE
+  error = TRUE,
+  edger_test = c("LRT", "QL")
 )
 }
 \arguments{
@@ -40,9 +41,11 @@ validate_vista_deep(
 \item{methods}{Character vector of backends to benchmark. Any subset of
 \code{c("deseq2", "edger", "limma")}.}
 
-\item{min_counts}{Minimum total counts per gene to retain.}
+\item{min_counts}{Minimum count a gene must reach in a sample to count as
+detected there; also the minimum row total.}
 
-\item{min_replicates}{Minimum samples per group meeting filtering criteria.}
+\item{min_replicates}{Minimum number of samples, across the whole
+experiment, in which a gene must reach \code{min_counts}.}
 
 \item{log2fc_cutoff}{Absolute log2 fold-change threshold for DEG calling.}
 
@@ -60,6 +63,9 @@ validate_vista_deep(
 for MA, volcano, DEG count, and PCA views.}
 
 \item{error}{Logical; if \code{TRUE}, abort when any discrepancy is detected.}
+
+\item{edger_test}{The edgeR test, \code{"LRT"} (the default until VISTA 1.4.0) or
+\code{"QL"}; see \code{\link[=create_vista]{create_vista()}}. VISTA and the reference both use it.}
 }
 \value{
 Invisibly returns the full benchmark report.
