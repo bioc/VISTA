@@ -7,6 +7,20 @@ make_small_vista <- function() {
   example_vista()
 }
 
+# PCA and MDS axes come from an eigendecomposition, and the sign of an
+# eigenvector is arbitrary: prcomp() and cmdscale() may return v or -v for the
+# same input, and which one you get depends on the LAPACK/BLAS build and on the
+# order of the input. A runner image update flipped both MDS axes and turned
+# the suite red without anything in VISTA changing; later, shuffling the genes
+# passed to get_pca_plot() flipped both PCA axes on Linux CI only. Magnitudes
+# are identical, so canonicalise each axis to a fixed orientation before
+# comparing -- a real change still moves the numbers.
+canon_axis <- function(v) {
+  if (!is.numeric(v) || !length(v)) return(v)
+  i <- which.max(abs(v))                       # largest coordinate is unambiguous
+  if (length(i) == 1L && !is.na(v[i]) && v[i] < 0) -v else v
+}
+
 make_benchmark_inputs <- function(n_genes = 150) {
   data("count_data", package = "VISTA", envir = environment())
   data("sample_metadata", package = "VISTA", envir = environment())

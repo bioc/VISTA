@@ -17,22 +17,25 @@
 # ---- helpers ----------------------------------------------------------------
 
 # Canonical form of a plot's layer-independent data, so two calls can be
-# compared without depending on row order.
-canon <- function(p) {
+# compared without depending on row order. `axes` names embedding coordinates
+# (PCA, MDS) whose sign is arbitrary; they are oriented with canon_axis() before
+# sorting, so a flipped eigenvector is not mistaken for an order dependence.
+canon <- function(p, axes = NULL) {
   d <- p$data
   if (!is.data.frame(d)) return(NULL)
   d <- as.data.frame(d, stringsAsFactors = FALSE)
+  for (ax in intersect(axes, names(d))) d[[ax]] <- canon_axis(d[[ax]])
   d <- d[, order(colnames(d)), drop = FALSE]
   d[] <- lapply(d, function(col) if (is.factor(col)) as.character(col) else col)
   key <- do.call(paste, c(d, sep = "\r"))
   d[order(key), , drop = FALSE]
 }
 
-expect_permutation_invariant <- function(fn, v, genes, ..., label = NULL) {
+expect_permutation_invariant <- function(fn, v, genes, ..., axes = NULL, label = NULL) {
   label <- label %||% "function"
-  a <- canon(fn(v, genes = genes, ...))
-  b <- canon(fn(v, genes = rev(genes), ...))
-  c_ <- canon(fn(v, genes = sample(genes), ...))
+  a <- canon(fn(v, genes = genes, ...), axes)
+  b <- canon(fn(v, genes = rev(genes), ...), axes)
+  c_ <- canon(fn(v, genes = sample(genes), ...), axes)
   skip_if(is.null(a), paste(label, "has no data frame to compare"))
   rownames(a) <- NULL; rownames(b) <- NULL; rownames(c_) <- NULL
   expect_equal(a, b, info = paste(label, "- reversed input"))
@@ -78,9 +81,39 @@ test_that("embedding plots do not depend on the order genes are supplied in", {
   v <- make_small_vista()
   genes <- rownames(v)[seq_len(10)]
 
-  expect_permutation_invariant(get_pca_plot, v, genes, label = "get_pca_plot")
-  expect_permutation_invariant(get_mds_plot, v, genes, label = "get_mds_plot")
+  expect_permutation_invariant(get_pca_plot, v, genes, axes = c("PC1", "PC2"), label = "get_pca_plot")
+  expect_permutation_invariant(get_mds_plot, v, genes, axes = c("Dim1", "Dim2"), label = "get_mds_plot")
   expect_permutation_invariant(get_corr_heatmap, v, genes, label = "get_corr_heatmap")
+})
+
+test_that("embedding comparisons ignore an axis sign flip but not a moved point", {
+  # On Linux CI, shuffling the genes passed to get_pca_plot() negated both PCA
+  # axes -- the same plot, mirrored. That must not count as an order
+  # dependence, while a coordinate that actually moves still must.
+  v <- make_small_vista()
+  genes <- rownames(v)[seq_len(10)]
+  embeddings <- list(
+    get_pca_plot = c("PC1", "PC2"),
+    get_mds_plot = c("Dim1", "Dim2")
+  )
+
+  for (nm in names(embeddings)) {
+    axes <- embeddings[[nm]]
+    p <- get(nm)(v, genes = genes)
+    ref <- canon(p, axes)
+
+    for (ax in axes) {
+      flipped <- p
+      flipped$data[[ax]] <- -flipped$data[[ax]]
+      expect_equal(canon(flipped, axes), ref, info = paste(nm, ax, "negated"))
+      # Without orienting the axes the flip reads as a difference, as on CI.
+      expect_false(isTRUE(all.equal(canon(flipped), canon(p))), info = paste(nm, ax, "unoriented"))
+    }
+
+    moved <- p
+    moved$data[[axes[1]]][1] <- moved$data[[axes[1]]][1] + 1
+    expect_false(isTRUE(all.equal(canon(moved, axes), ref)), info = paste(nm, "moved point"))
+  }
 })
 
 # ---- 2. label/value correspondence, checked against the object --------------
